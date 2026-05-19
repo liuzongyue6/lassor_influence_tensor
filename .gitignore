@@ -1,0 +1,17 @@
+# 输出和计算结果
+outputs/
+InfluenceMatrix/
+
+# Python相关
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
