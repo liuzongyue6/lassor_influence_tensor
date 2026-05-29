@@ -1,6 +1,7 @@
 # 输出和计算结果
 outputs/
-InfluenceMatrix/
+InfluenceMatrix/   
+
 
 # Python相关
 __pycache__/
@@ -15,3 +16,4 @@ env/
 .idea/
 *.swp
 *.swo
+.claude/

@@ -1,5 +1,7 @@
 # Inertia Relief Influence Tensor: STRS/STRN + LASSO Workflow
 
+> **Note — Legacy / Coupon case only**: This document describes the original Coupon dataset workflow (single target subcase, 24 elements, standard LASSO). The production pipeline for fatigue-aware sparse load recovery from a dense multi-load target is documented in [`docs/fatigue_lasso_method.md`](fatigue_lasso_method.md). The Coupon workflow remains valid as a fast regression baseline (`relative_error < 5%`).
+
 This document defines the full, reproducible workflow to parse OptiStruct .strs/.strn files, build the influence matrix $H$ and target vector $E_{target}$, run LASSO to recover sparse load channels, and export traceable outputs. Only .strs and .strn files are used. Subcase IDs are the only load identifiers.
 
 ## 1) Inputs And Scope

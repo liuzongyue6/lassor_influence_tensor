@@ -1,6 +1,6 @@
 # Inertia Relief Influence Tensor Workflow
 
-This repository builds a stress/strain influence matrix from OptiStruct .strs/.strn outputs, solves for sparse loads using LASSO, and verifies the reconstructed field against a target inertia-relief result.
+This repository builds a stress/strain influence matrix from OptiStruct .strs/.strn outputs, solves for a **sparse set of load groups** using Group LASSO or BCD, and reproduces a target stress tensor (from a dense multi-load source such as an IR event) with a user-specified sparsity budget.
 
 ## Project Layout
 
@@ -44,10 +44,13 @@ Outputs:
 
 ## How The Pipeline Works
 
+> **Simple / Coupon path** (single subcase, 24 elements): steps 1–5 below use `ir_lasso_pipeline.py`.  
+> **Production / Fatigue path** (18 254 elements, MAX+MIN subcases, ranking enforcement): see `fatigue_lasso_pipeline.py` and [`docs/fatigue_lasso_method.md`](docs/fatigue_lasso_method.md).
+
 1) Parse .strs/.strn files by SUBCASE and element ID (aligned by element ID order).
 2) Flatten per-element components into a vector using a fixed order.
-3) Build $H$ from unit-load subcases and $E_{target}$ from the inertia-relief target.
-4) Solve $\min_F \frac{1}{2n}\|HF - E_{target}\|_2^2 + \alpha\|F\|_1$ using LassoCV.
+3) Build $H$ (candidate load library) and $\sigma_{target}$ (target stress from dense loads).
+4) Solve $\min_F \frac{1}{2n}\|HF - \sigma_{target}\|_2^2 + \alpha\|F\|_1$ using LassoCV.
 5) Reconstruct loads using SUBCASE IDs and validate with a verification run.
 
 ## Common Causes Of Mismatch (Target vs Verified)
@@ -64,9 +67,16 @@ Outputs:
 3) Apply component weighting to balance XX/YY/XY.
 4) Use SVD/PCA to quantify target projection error on the $H$ column space.
 
+## Claude Code Analysis Documentation
+
+Claude Code follows a standing protocol in this project: whenever it performs fatigue simulation analysis, ML analysis (LASSO/IRLS behaviour, influence scores, ranking convergence), or derives non-obvious insights from the data, it **persists those findings to [`docs/fatigue_lasso_method.md`](docs/fatigue_lasso_method.md)** in a dated subsection.
+
+This means `fatigue_lasso_method.md` serves as both a technical reference and a living research log. Check it for the most current understanding of why algorithmic decisions were made.
+
 ## Notes
 
 - All parsing uses only .strs/.strn files.
 - SUBCASE IDs are the only load identifiers.
 - By default, all outputs include a timestamp suffix; use --no-timestamp to keep legacy names.
-- For details, see docs/ir_lasso_workflow.md.
+- For the Coupon case workflow, see [docs/ir_lasso_workflow.md](docs/ir_lasso_workflow.md).
+- For the production fatigue pipeline, see [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md).
