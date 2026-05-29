@@ -396,6 +396,18 @@ def _element_ranks(s_e: np.ndarray) -> np.ndarray:
     return ranks
 
 
+def _vm_single(stress_6: np.ndarray) -> float:
+    """Von Mises range for a single 6-component vector [XX1,YY1,XY1,XX2,YY2,XY2].
+
+    Used by SLSQP constraint functions so only 6-component sub-vectors need
+    to be evaluated — avoids recomputing H@f over the full m-row matrix.
+    """
+    xx1, yy1, xy1, xx2, yy2, xy2 = stress_6
+    vm1 = np.sqrt(max(xx1**2 + yy1**2 - xx1 * yy1 + 3.0 * xy1**2, 0.0))
+    vm2 = np.sqrt(max(xx2**2 + yy2**2 - xx2 * yy2 + 3.0 * xy2**2, 0.0))
+    return max(vm1, vm2)
+
+
 def _weighted_ols_fixed_support(
     H: np.ndarray,
     target: np.ndarray,
@@ -711,6 +723,206 @@ def solve_bcd(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 ranking mode — SLSQP constrained optimisation
+# ---------------------------------------------------------------------------
+
+def solve_ranking_constrained(
+    H: np.ndarray,
+    delta_sigma: np.ndarray,
+    active_mask: np.ndarray,
+    target_ranking: List[int],
+    elem_ids: List[int],
+    n_comp: int,
+    f_init: np.ndarray,
+    margin: float = 0.0,
+    max_iter: int = 20,
+) -> Tuple[np.ndarray, dict]:
+    """Direct ranking optimisation on fixed active support (--irls-mode ranking).
+
+    Goal: find f such that VM_range(critical element) > VM_range(all others).
+    This is NOT a stress-matching problem — the objective is global Δσ fit,
+    and the constraints directly enforce the damage-ranking goal.
+
+    Algorithm (outer loop, max_iter iterations):
+      Precompute: HtH = H_active^T H_active  (n×n)
+                  Htb = H_active^T delta_sigma (n,)
+      Each iteration:
+        1. Compute ranking from current f
+        2. For each critical element c with desired rank p and current rank r:
+             blockers = elements currently ranked 1..p (must be displaced below c)
+             Add SLSQP constraint: VM_c(f) - VM_blocker(f) >= margin
+        3. Solve SLSQP: min f^T HtH f - 2 Htb^T f  s.t. constraints
+        4. Update f_current; track best state
+        5. Break on convergence or 3 no-improvements
+
+    Key advantage vs residual mode: no element weight saturation — constraints
+    express the ranking goal directly, and the objective is always global fit.
+    """
+    try:
+        from scipy.optimize import minimize as _sp_minimize
+    except ImportError as exc:
+        raise SystemExit("scipy is required for --irls-mode ranking: pip install scipy") from exc
+
+    H_active = H[:, active_mask]
+    n_active  = H_active.shape[1]
+    n_elem    = len(elem_ids)
+    elem_idx  = {eid: i for i, eid in enumerate(elem_ids)}
+    K         = len(target_ranking)
+
+    # Precompute normal equations (cheap: n×n where n = 3*|active_groups| ≤ ~45)
+    HtH = H_active.T @ H_active
+    Htb = H_active.T @ delta_sigma
+    b_norm_sq = float(np.dot(delta_sigma, delta_sigma))
+
+    def _objective(fa: np.ndarray) -> float:
+        return float(fa @ HtH @ fa) - 2.0 * float(Htb @ fa) + b_norm_sq
+
+    def _grad_objective(fa: np.ndarray) -> np.ndarray:
+        return 2.0 * (HtH @ fa - Htb)
+
+    f_current = f_init[active_mask].copy()
+    best_satisfied = -1
+    best_state: Optional[dict] = None
+    no_improve_count = 0
+    history: List[dict] = []
+
+    for k in range(max_iter):
+        # ── Current state ─────────────────────────────────────────────────
+        delta_pred = H_active @ f_current
+        s_e   = compute_von_mises_range(delta_pred, n_elem, COMPONENT_ORDER)
+        ranks = _element_ranks(s_e)
+
+        n_satisfied = 0
+        details = []
+        constraints = []
+
+        for p_idx, crit_id in enumerate(target_ranking):
+            desired_rank = p_idx + 1
+            if crit_id not in elem_idx:
+                details.append({"elem": crit_id, "desired": desired_rank, "actual": -1, "proxy": 0.0})
+                continue
+            crit_i      = elem_idx[crit_id]
+            actual_rank = int(ranks[crit_i])
+            details.append({"elem": crit_id, "desired": desired_rank, "actual": actual_rank,
+                             "proxy": float(s_e[crit_i])})
+
+            if actual_rank == desired_rank:
+                n_satisfied += 1
+                continue
+
+            # Precompute critical element H submatrix (6 × n_active)
+            H_crit_sub = H_active[crit_i * n_comp : (crit_i + 1) * n_comp, :]
+
+            # Blockers: elements ranked above desired_rank (must be pushed below crit)
+            blocker_indices = [
+                j for j in range(n_elem)
+                if ranks[j] <= desired_rank and j != crit_i
+            ]
+            # Also include any element currently ranked between desired_rank and actual_rank
+            blocker_indices += [
+                j for j in range(n_elem)
+                if desired_rank < ranks[j] < actual_rank and j != crit_i
+            ]
+            blocker_indices = list(set(blocker_indices))
+
+            for bi in blocker_indices:
+                H_blocker_sub = H_active[bi * n_comp : (bi + 1) * n_comp, :]
+                # Close over sub-matrices by value to avoid late-binding issues
+                def _make_con(Hc=H_crit_sub.copy(), Hb=H_blocker_sub.copy()):
+                    def _con(fa):
+                        return _vm_single(Hc @ fa) - _vm_single(Hb @ fa) - margin
+                    return _con
+                constraints.append({"type": "ineq", "fun": _make_con()})
+
+        rel_err = float(np.linalg.norm(H_active @ f_current - delta_sigma)
+                        / (np.linalg.norm(delta_sigma) + 1e-12))
+        history.append({"iter": k, "n_satisfied": n_satisfied, "rel_err": rel_err, "details": details})
+
+        _log(
+            f"[Iter {k:2d}][ranking] satisfied {n_satisfied}/{K} "
+            f"| range_err={rel_err:.3%} | constraints={len(constraints)}"
+        )
+        for d in details:
+            status = "OK" if d["actual"] == d["desired"] else "--"
+            print(
+                f"         [{status}] elem={d['elem']:>10d}  "
+                f"desired={d['desired']:>3d}  actual={d['actual']:>5d}  "
+                f"proxy={d['proxy']:.3e}",
+                flush=True,
+            )
+
+        # Track best state
+        if n_satisfied > best_satisfied:
+            best_satisfied = n_satisfied
+            best_state = {
+                "f_active": f_current.copy(),
+                "iter": k,
+                "s_e": s_e.copy(),
+                "ranks": ranks.copy(),
+                "rel_err": rel_err,
+            }
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        if n_satisfied == K:
+            _log(f"[INFO] All {K} ranking constraints satisfied at iteration {k}.")
+            break
+        if no_improve_count >= 3:
+            _log(f"[INFO] No improvement for 3 consecutive iterations. Best: {best_satisfied}/{K}.")
+            break
+
+        if not constraints:
+            _log(f"[INFO] No active constraints at iteration {k} — done.")
+            break
+
+        # ── SLSQP solve ────────────────────────────────────────────────────
+        result = _sp_minimize(
+            _objective,
+            f_current,
+            jac=_grad_objective,
+            method="SLSQP",
+            constraints=constraints,
+            options={"maxiter": 200, "ftol": 1e-10, "disp": False},
+        )
+        if not result.success and result.status not in (0, 9):
+            _log(f"[WARNING] SLSQP iter {k}: {result.message} (continuing with best feasible point)")
+        f_current = result.x
+
+    assert best_state is not None
+    # Reconstruct full-size f_range
+    final_f = np.zeros(H.shape[1])
+    final_f[active_mask] = best_state["f_active"]
+    s_e_final   = best_state["s_e"]
+    ranks_final = best_state["ranks"]
+
+    ranking_table = [
+        {
+            "elem_id":       c,
+            "desired_rank":  p,
+            "achieved_rank": int(ranks_final[elem_idx[c]]) if c in elem_idx else -1,
+            "damage_proxy":  float(s_e_final[elem_idx[c]]) if c in elem_idx else 0.0,
+        }
+        for p, c in enumerate(target_ranking, start=1)
+    ]
+
+    residual = H @ final_f - delta_sigma
+    diag: dict = {
+        "ranking_satisfied":    best_satisfied == K,
+        "satisfied_count":      best_satisfied,
+        "total_critical":       K,
+        "best_iteration":       best_state["iter"],
+        "iterations_run":       len(history),
+        "final_relative_error": float(np.linalg.norm(residual) / (np.linalg.norm(delta_sigma) + 1e-12)),
+        "ranking_table":        ranking_table,
+        "history":              history,
+        "irls_mode":            "ranking",
+        "basis_insufficient_warning": (best_satisfied < K and best_state["iter"] == 0),
+    }
+    return final_f, diag
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 + Phase 3 combined: IRLS ranking loop
 # ---------------------------------------------------------------------------
 
@@ -729,6 +941,8 @@ def solve_phase1_with_ranking(
     mandatory_feature_mask: Optional[np.ndarray] = None,
     gamma: float = 2.0,
     max_iter: int = 10,
+    irls_mode: str = "residual",
+    ranking_margin: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
     """Phase 1 (group LASSO / BCD on Δσ) + optional Phase 3 (fixed-support IRLS).
 
@@ -797,6 +1011,18 @@ def solve_phase1_with_ranking(
         f"| alpha: {alpha_used:.4e}"
     )
 
+    # ── Route to ranking mode (SLSQP) if requested ────────────────────────
+    if irls_mode == "ranking":
+        _log(f"[INFO] Phase 3 (ranking mode): SLSQP constrained optimisation on fixed support...")
+        final_f, diag = solve_ranking_constrained(
+            H, delta_sigma, active_mask_fixed, target_ranking,
+            elem_ids, n_comp, f_init=p1_result["coef"],
+            margin=ranking_margin, max_iter=max_iter,
+        )
+        diag["irls_mode"] = "ranking"
+        return final_f, active_mask_fixed, alpha_used, diag
+
+    # ── Residual mode: IRLS — magnitude tuning on fixed support ───────────
     # Per-critical-element weight multipliers (updated independently)
     per_elem_mult: Dict[int, float] = {
         eid: float(weights_init[elem_idx[eid] * n_comp])
@@ -808,16 +1034,27 @@ def solve_phase1_with_ranking(
     best_state: Optional[dict] = None
     no_improve_count = 0
     history: List[dict] = []
+    initial_rel_err: Optional[float] = None
 
-    # ── Phase 3: IRLS — magnitude tuning on fixed support ─────────────────
     for k in tqdm(range(max_iter), desc="IRLS ranking iterations"):
         # Weighted OLS on FIXED support — no new group selection
         f_range    = _weighted_ols_fixed_support(H, delta_sigma, weights, active_mask_fixed)
         residual   = H @ f_range - delta_sigma
         rel_err    = float(np.linalg.norm(residual) / (np.linalg.norm(delta_sigma) + 1e-12))
+        if initial_rel_err is None:
+            initial_rel_err = rel_err
         delta_pred = H @ f_range
         s_e        = compute_von_mises_range(delta_pred, n_elem, COMPONENT_ORDER)
         ranks      = _element_ranks(s_e)
+
+        # Warn if error exploded (weight saturation indicator)
+        if k > 0 and rel_err > 2.0 * initial_rel_err:
+            _log(
+                f"[WARNING] Iter {k}: error {rel_err:.3%} = "
+                f"{rel_err / initial_rel_err:.1f}× initial {initial_rel_err:.3%}. "
+                f"Weight saturation — OLS now fits only the critical element, global fit collapsed. "
+                f"Consider --irls-mode ranking."
+            )
 
         # Check ranking satisfaction
         n_satisfied = 0
@@ -880,8 +1117,8 @@ def solve_phase1_with_ranking(
             break
 
         # IRLS weight update — each critical element grows independently by γ^gap
-        # Use log-space arithmetic to prevent float64 overflow for large gaps
-        # (e.g. gap=2317 with gamma=2.0 → 2.0^2317 >> 1.8e308)
+        # Log-space arithmetic prevents float64 overflow for large rank gaps
+        # (e.g. gap=2317 with gamma=2.0 → 2.0^2317 >> float64 max ~1.8e308)
         _LOG_CAP = np.log(1e8)
         for c, cidx, gap in needs_boost:
             old_w = per_elem_mult[c]
@@ -911,16 +1148,40 @@ def solve_phase1_with_ranking(
         for p, c in enumerate(target_ranking, start=1)
     ]
 
+    basis_insufficient = K > 0 and best_satisfied < K and best_state["iter"] == 0
+    if basis_insufficient:
+        _log(
+            f"[WARNING] IRLS never improved on Phase 1 (best_iteration=0, "
+            f"{n_active_fixed} active groups)."
+        )
+        _log("[WARNING] Weight boosting WORSENED ranking — the active group span cannot place")
+        _log("[WARNING]   the critical element(s) above current competitors.")
+        for row in ranking_table:
+            if row["achieved_rank"] != row["desired_rank"]:
+                gap = row["achieved_rank"] - row["desired_rank"]
+                _log(
+                    f"[WARNING]   elem {row['elem_id']:>10d}: target rank {row['desired_rank']}, "
+                    f"best achieved {row['achieved_rank']} (gap={gap})"
+                )
+        _log("[WARNING] Likely cause: other elements are more sensitive to the active force groups.")
+        _log("[WARNING] Interventions:")
+        _log(f"[WARNING]   1. --irls-mode ranking (SLSQP, avoids weight saturation)")
+        _log(f"[WARNING]   2. --max-active-groups N (currently {n_active_fixed}; try 6, 8, or max)")
+        _log("[WARNING]   3. --gamma 1.1 --max-ranking-iter 50 (slower weight growth)")
+        _log("[WARNING]   4. --feasibility-check to see if unconstrained OLS achieves target rank")
+
     residual = H @ final_f - delta_sigma
     diag: dict = {
-        "ranking_satisfied":   best_satisfied == K,
-        "satisfied_count":     best_satisfied,
-        "total_critical":      K,
-        "best_iteration":      best_state["iter"],
-        "iterations_run":      len(history),
-        "final_relative_error": float(np.linalg.norm(residual) / (np.linalg.norm(delta_sigma) + 1e-12)),
-        "ranking_table":       ranking_table,
-        "history":             history,
+        "ranking_satisfied":        best_satisfied == K,
+        "satisfied_count":          best_satisfied,
+        "total_critical":           K,
+        "best_iteration":           best_state["iter"],
+        "iterations_run":           len(history),
+        "final_relative_error":     float(np.linalg.norm(residual) / (np.linalg.norm(delta_sigma) + 1e-12)),
+        "ranking_table":            ranking_table,
+        "history":                  history,
+        "irls_mode":                "residual",
+        "basis_insufficient_warning": basis_insufficient,
     }
 
     return final_f, final_mask, final_alpha, diag
@@ -950,13 +1211,19 @@ def run_fatigue_pipeline(
     gamma: float = 2.0,
     auto_mandatory_top_k: int = 2,
     mandatory_groups: Optional[List[int]] = None,
+    irls_mode: str = "residual",
+    ranking_margin: float = 0.0,
+    feasibility_check: bool = True,
 ) -> dict:
     """Full fatigue LASSO pipeline.
 
     Phase 0: Influence-guided mandatory group pre-selection (guarantees coverage)
+             Optional feasibility check via unconstrained OLS (--feasibility-check)
     Phase 1: Weighted Group LASSO / BCD on Δσ = σ_max − σ_min
     Phase 2: Restricted OLS on σ_mean on Phase-1 active groups
-    Phase 3: Fixed-support IRLS ranking refinement (only if target_ranking given)
+    Phase 3: Fixed-support ranking refinement (only if target_ranking given)
+             residual mode: IRLS weight boosting (default)
+             ranking mode:  SLSQP constrained OLS (--irls-mode ranking)
     """
     if mandatory_groups is None:
         mandatory_groups = []
@@ -1001,6 +1268,9 @@ def run_fatigue_pipeline(
     # Union of all critical + ranking elements for initial weight assignment
     all_critical = list(dict.fromkeys(critical_elem_ids + target_ranking))
     weights_init = build_element_weights(ref_ids, len(COMPONENT_ORDER), all_critical, critical_weight)
+
+    # element index map used in Phase 0 feasibility check and final reporting
+    elem_idx_map = {eid: i for i, eid in enumerate(ref_ids)}
 
     # ── Phase 0: influence-guided mandatory group selection ────────────────
     mandatory_feature_mask = np.zeros(H.shape[1], dtype=bool)
@@ -1048,6 +1318,31 @@ def run_fatigue_pipeline(
             influence_dict, n_groups, subcase_ids,
         )
 
+    # ── Phase 0 feasibility check (optional) ──────────────────────────────
+    if feasibility_check and all_critical and target_ranking:
+        _log(f"[INFO] Phase 0 feasibility: unconstrained OLS (all {n_groups} groups)...")
+        f_full_ols, _, _, _ = np.linalg.lstsq(H, delta_sigma, rcond=None)
+        err_full = float(
+            np.linalg.norm(H @ f_full_ols - delta_sigma) / (np.linalg.norm(delta_sigma) + 1e-12)
+        )
+        s_e_full   = compute_von_mises_range(H @ f_full_ols, n_elem, COMPONENT_ORDER)
+        ranks_full = _element_ranks(s_e_full)
+        _log(f"[INFO]   Unconstrained OLS error = {err_full:.3%}")
+        _log(f"         {'elem_id':>12s}  {'unconstrained_rank':>18s}  {'desired_rank':>12s}")
+        for eid in all_critical:
+            if eid not in elem_idx_map:
+                continue
+            unc_rank    = int(ranks_full[elem_idx_map[eid]])
+            desired     = target_ranking.index(eid) + 1 if eid in target_ranking else None
+            desired_str = str(desired) if desired else "—"
+            _log(f"         {eid:>12d}  {unc_rank:>18d}  {desired_str:>12s}")
+            if desired is not None and unc_rank > desired:
+                _log(
+                    f"[WARNING] Phase 0 feasibility: elem {eid} ranks {unc_rank} even with ALL "
+                    f"{n_groups} groups unconstrained (desired: {desired}). "
+                    f"The SPC basis cannot achieve this ranking under ANY sparse selection."
+                )
+
     # ── Phase 1 (+ Phase 3 if ranking requested) ──────────────────────────
     _log("[INFO] Phase 1/3: Group LASSO + IRLS on stress range (delta_sigma)...")
     f_range, active_mask, alpha_used, diag_ranking = solve_phase1_with_ranking(
@@ -1065,6 +1360,8 @@ def run_fatigue_pipeline(
         mandatory_feature_mask=mandatory_feature_mask if mandatory_feature_mask.any() else None,
         gamma=gamma,
         max_iter=max_ranking_iter,
+        irls_mode=irls_mode,
+        ranking_margin=ranking_margin,
     )
 
     active_groups = _count_active_groups(active_mask, GROUP_SIZE)
@@ -1105,7 +1402,6 @@ def run_fatigue_pipeline(
     ranks = _element_ranks(s_e)
     if all_critical:
         s_e_target   = compute_von_mises_range(delta_sigma, n_elem, COMPONENT_ORDER)
-        elem_idx_map = {eid: i for i, eid in enumerate(ref_ids)}
         _log("[INFO] Critical element Von Mises range stress (target vs predicted):")
         _log(f"       {'elem_id':>12s}  {'target_VM':>12s}  {'pred_VM':>12s}  {'ratio':>8s}  {'pred_rank':>9s}")
         for eid in all_critical:
@@ -1159,6 +1455,9 @@ def run_fatigue_pipeline(
         "standardize": standardize,
         "gamma": gamma,
         "max_ranking_iter": max_ranking_iter,
+        "irls_mode": irls_mode,
+        "ranking_margin": ranking_margin,
+        "feasibility_check": feasibility_check,
     }
 
     return {"metadata": metadata}
@@ -1222,11 +1521,31 @@ def main() -> None:
                         help="Comma-separated 0-indexed group indices to always activate (Phase 0), "
                              "e.g. '0,3,7'")
 
-    # IRLS settings
+    # IRLS / ranking settings
     parser.add_argument("--max-ranking-iter", type=int, default=10,
-                        help="Max IRLS iterations for ranking refinement")
+                        help="Max iterations for Phase-3 ranking refinement")
     parser.add_argument("--gamma", type=float, default=2.0,
-                        help="IRLS weight amplification factor per rank-gap unit (γ^gap)")
+                        help="(residual mode) IRLS weight amplification factor per rank-gap unit")
+    parser.add_argument(
+        "--irls-mode", choices=["residual", "ranking"], default="residual",
+        help=(
+            "'residual' (default): IRLS weight boosting — amplifies critical element residuals. "
+            "Side effect: weight may saturate at 1e8, collapsing global fit. "
+            "'ranking': SLSQP constrained OLS — objective is global fit; "
+            "constraints directly enforce VM_crit >= VM_competitor. No weight saturation."
+        ),
+    )
+    parser.add_argument(
+        "--ranking-margin", type=float, default=0.0,
+        help="(ranking mode) Required margin VM_crit - VM_competitor >= margin (Pa). Default 0.",
+    )
+
+    # Phase 0 feasibility check
+    parser.add_argument("--feasibility-check",    dest="feasibility_check", action="store_true",
+                        help="Run unconstrained OLS before Phase 1 to log achievable rank upper bound.")
+    parser.add_argument("--no-feasibility-check", dest="feasibility_check", action="store_false",
+                        help="Skip unconstrained OLS feasibility check (faster startup).")
+    parser.set_defaults(feasibility_check=True)
 
     # Standardization
     parser.add_argument("--standardize",    dest="standardize", action="store_true")
@@ -1269,6 +1588,9 @@ def main() -> None:
         gamma=args.gamma,
         auto_mandatory_top_k=args.auto_mandatory_top_k,
         mandatory_groups=mandatory_groups,
+        irls_mode=args.irls_mode,
+        ranking_margin=args.ranking_margin,
+        feasibility_check=args.feasibility_check,
     )
 
     meta = result["metadata"]

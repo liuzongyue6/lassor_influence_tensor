@@ -1,9 +1,8 @@
-# Sparse Load Identification for Fatigue-Critical Stress Ranking via Influence Tensor and Group LASSO
+# Sparse Load Identification for Fatigue-Critical Stress Ranking via Influence Tensor and Group LASSO (least absolute shrinkage and selection operator)
 
 > **Scope**: The running example uses an inertia-relief (IR) event as the target, but the method applies to any dense-load target stress tensor (e.g., a road-load event synthesised from 96 channels). "IR" in section headings is shorthand for the specific Cradle HAZ case, not a method constraint.
 
-> **Document purpose**: Technical reference for internal engineers + draft foundation for journal/conference publication.
-> **Version**: V2 (fixed-support IRLS + influence-guided mandatory group selection)
+> **Document purpose**: Technical reference.
 > **Last updated**: 2026-05-27
 
 ---
@@ -34,7 +33,7 @@ Root cause: fatigue damage scales with **stress range** Δσ = σ_max − σ_min
 
 | Quantity | Value |
 |---------|-------|
-| FE model | Xpeng Cradle Heat-Affected Zone (HAZ) weld region |
+| FE model | Cradle Heat-Affected Zone (HAZ) weld region |
 | Elements | 18,254 shell elements (CQUAD4) |
 | Stress components per element | 6 (XX1, YY1, XY1, XX2, YY2, XY2 — top/bottom face) |
 | Total rows in influence matrix H | 18,254 × 6 = **109,524** |
@@ -107,7 +106,7 @@ Final joint OLS on all selected columns removes shrinkage.
 
 **Why BCD is sound**: The objective is convex in (f_mand, f_free) jointly. BCD converges to the global optimum. Mandatory groups have no LASSO penalty — they are guaranteed active regardless of global error distribution.
 
-### 2.4 Phase 2 — Mean Stress Matching (Restricted OLS)
+### 2.4 Phase 2 — Mean Stress Matching ROLS (Restricted Ordinary Least Squares)
 
 After Phase 1 locks the active set A, recover **f_mean** independently:
 
@@ -129,7 +128,7 @@ $$
 
 If the user specifies a target ranking [c₁, c₂, ..., c_K] (c_p must achieve global rank p), Phase 3 runs an IRLS weight-boosting loop **on the fixed support from Phase 1**.
 
-**Critical V2 design principle**: the active set A is frozen after Phase 1. Phase 3 only adjusts force magnitudes.
+**Critical design principle**: the active set A is frozen after Phase 1. Phase 3 only adjusts force magnitudes.
 
 ```
 For iteration k = 1..max_iter:
@@ -146,7 +145,7 @@ For iteration k = 1..max_iter:
     if no improvement for 3 consecutive iterations:  break
 ```
 
-**Why fixed support is essential**: In V1, the IRLS loop re-ran the group LASSO binary search each iteration. As weights for element 10058616 grew, the binary search selected a different group set — one that no longer fit the other elements — and the global error jumped from 34.8% to 139.4%. By fixing A, the weight update directly amplifies the influence of element 10058616's rows in the OLS system, causing larger predicted stress at that element without destabilising the rest of the fit.
+**Why fixed support is essential**: If the IRLS loop re-ran the group LASSO binary search each iteration. As weights for element 10058616 grew, the binary search selected a different group set — one that no longer fit the other elements — and the global error jumped from 34.8% to 139.4%. By fixing A, the weight update directly amplifies the influence of element 10058616's rows in the OLS system, causing larger predicted stress at that element without destabilising the rest of the fit.
 
 ### 2.7 Damage Proxy
 
@@ -234,6 +233,178 @@ Run configuration: `--max-active-groups 3` (parsed as 3 due to Windows PowerShel
 | Phase 3 uses OLS not LASSO | OLS preserves the influence of weight amplification directly in the normal equations |
 | Phase 2 uses same active set | Physical consistency: f_max and f_min share application points |
 | Per-element independent weights | Avoids cross-contamination: boosting c_1 doesn't over-penalise c_2's residual |
+
+### 4.3 — 2026-05-28: Ranking Enforcement Mechanism, Failure Modes, and Interventions
+
+#### 4.3.1 How Phase 0→1→3 Enforces Element Damage Ranking
+
+The algorithm has three layers of ranking enforcement, each with a distinct role:
+
+**Phase 0 — Influence-guided mandatory group selection**  
+Before any optimisation, Phase 0 computes the Frobenius norm of H submatrices for each critical element and each force group:
+
+$$\text{influence}(e, g) = \|\mathbf{H}_{e,g}\|_F$$
+
+The top-K groups per critical element are **mandated** as permanently active. This guarantees the force basis spans the critical element's stress space — a necessary (but not sufficient) condition for the ranking constraint to be achievable.
+
+**Phase 1 (BCD) — Group selection with guaranteed coverage**  
+Phase 1 runs once to fix `active_mask_fixed`. With mandatory groups, BCD alternates:
+- `f_mand` ← WeightedOLS(H_mand, Δσ − H_free f_free)
+- `f_free` ← GroupLasso(H_free, Δσ − H_mand f_mand, ≤ free_budget groups)
+
+The mandatory groups are always in the final active set, regardless of global error distribution.
+
+**Phase 3 — Magnitude refinement on fixed support**  
+Two modes are available (see §4.3.6):
+
+*Residual mode* (`--irls-mode residual`, default): Iterative Re-weighted Least Squares boosts critical element row weights by γ^gap per iteration:
+$$w_e \leftarrow \min\!\left(w_e \cdot \gamma^{\mathrm{gap}},\ 10^8\right), \quad \mathrm{gap} = r_e - p_e$$
+where r_e = actual rank, p_e = desired rank. The OLS solver then places more weight on minimising the critical element's residual, driving its predicted stress higher — IF the active force groups can physically produce that stress.
+
+*Ranking mode* (`--irls-mode ranking`): SLSQP constrained optimisation. Objective is global fit; constraints directly enforce the ranking goal (see §4.3.6).
+
+---
+
+#### 4.3.2 Failure Evidence: 3-Group Run (2026-05-27)
+
+Run configuration: `--max-active-groups 3 --auto-mandatory-top-k 2 --critical-elems 10058616 --target-ranking 10058616`
+
+**Group influence scores for element 10058616 (all 15 groups):**
+
+| Group | Lead subcase | Influence (Frob.) | Selected as mandatory? |
+|-------|-------------|-------------------|----------------------|
+| 0 | 1 | 1.072e-02 | — |
+| 1 | 7 | **2.386e-02** | ✓ (2nd highest) |
+| 2 | 13 | 7.030e-03 | — |
+| 3 | 19 | 1.071e-02 | — |
+| 4 | 25 | 7.729e-03 | — |
+| 5 | 31 | 2.337e-02 | — |
+| 6 | 37 | 5.638e-03 | — |
+| 7 | 43 | 1.256e-02 | — |
+| 8 | 49 | 7.960e-03 | — |
+| 9 | 55 | **2.580e-02** | ✓ (highest) |
+| 10 | 85 | 1.276e-02 | — |
+| 11 | 91 | 1.530e-02 | — |
+| 12 | 94 | 1.106e-02 | — |
+| 13 | 97 | 9.881e-03 | — |
+| 14 | 100 | 5.341e-03 | — |
+
+Note: all influence scores are uniformly low (range 5.3e-03 to 2.58e-02) with no dominant group.
+
+**IRLS iteration history (residual mode):**
+
+| Iteration | Element 10058616 rank | Δσ relative error | Weight for 10058616 |
+|-----------|----------------------|-------------------|---------------------|
+| 0 (Phase 1 result) | 41 | 30.93% | 10 (initial) |
+| 1 | **112** (worse!) | **98.6%** | 1.0e+08 (cap reached) |
+| 2 | 112 | 98.6% | 1.0e+08 |
+| 3 | 112 | 98.6% | 1.0e+08 |
+| → best_iteration = 0 | | | |
+
+**FEA simulation result** (f_max / f_min from 3-group run applied in full model):
+
+| Rank | Element | Damage / event | Stress range (Pa) |
+|------|---------|---------------|-------------------|
+| 1 | 10032399 | 2.96e-04 | 1289 |
+| 2 | 10068361 | 8.88e-05 | 818 |
+| … | … | … | … |
+| 20 | **10058616** | **2.60e-05** | **562** |
+
+Element 10058616 is 11× lower damage than rank 1, confirming the 3-group LASSO force set cannot reproduce the target damage ranking.
+
+---
+
+#### 4.3.3 Root Cause: Basis Insufficiency (Linear Inseparability)
+
+Under any linear combination of the 3 active force groups, the Von Mises stress range at element e is:
+
+$$s_e(\mathbf{f}_A) = \mathrm{VM\_range}\!\left(\mathbf{H}_{e,A}\,\mathbf{f}_A\right)$$
+
+where H_{e,A} ∈ ℝ^(6×|A|) is the element's row block restricted to active columns.
+
+For element 10058616 to rank #1, there must exist f_A such that:
+$$s_{10058616}(\mathbf{f}_A) > s_e(\mathbf{f}_A) \quad \text{for all } e \neq 10058616$$
+
+If the column structure of H[:, A] excites other elements more strongly than 10058616 **for every direction f_A**, this condition is impossible — no weight boosting can overcome it.
+
+**Evidence from the run:**
+- At iter 0 (Phase 1 result, weight = 10): rank 41
+- At iter 1 (weight boosted to cap 1e8): rank 112 — WORSE
+- The force vector that best matches element 10058616's stress components happens to amplify other elements (ranked 1–111) even more
+
+**Physical interpretation:** Element 10058616 ranks #1 in the ground-truth IR event likely due to the distributed inertia body-load component of that event. Point-force SPC loads produce a fundamentally different spatial stress distribution, where other structural elements (e.g., 10032399 near a stiffness discontinuity) are more excited by any linear combination of SPC channels. The SPC basis is structurally unable to replicate the IR body-load spatial pattern.
+
+---
+
+#### 4.3.4 Algorithm Self-Diagnostic Signals
+
+The algorithm detects this failure mode internally. The following signals appear in `run_log_*.txt` and on the console:
+
+| Signal | Location | Meaning |
+|--------|----------|---------|
+| `best_iteration: 0` | `ranking_diagnostics` JSON | IRLS never found a better solution than Phase 1 |
+| `basis_insufficient_warning: true` | `ranking_diagnostics` JSON | Explicit failure flag (programmatically detectable) |
+| `[WARNING] IRLS never improved…` | console | Post-loop structured warning with gap details |
+| `[WARNING] Iter k: error X = N× initial` | console | Weight saturation detected in-loop |
+| `[WARNING] Phase 0 feasibility: elem … ranks … even with ALL groups` | console | Unconstrained OLS also fails → SPC basis is fundamentally insufficient |
+
+The `--feasibility-check` flag (default: on) runs unconstrained OLS (all 15 groups, no sparsity) before Phase 1. If element 10058616 cannot rank #1 even with all groups, then no sparse selection can achieve it — this is the definitive diagnosis of SPC basis insufficiency.
+
+---
+
+#### 4.3.5 Intervention Strategies
+
+| Strategy | CLI parameter | Expected effect |
+|----------|--------------|----------------|
+| Switch to ranking mode | `--irls-mode ranking` | Avoids weight saturation; SLSQP optimises ranking directly |
+| More active groups | `--max-active-groups 6` (or 8, 10, 15) | Larger force basis; more directions to potentially dominate competitors |
+| Unconstrained feasibility test | `--max-active-groups 15` (= all groups) | Determines whether SPC basis can achieve target rank at all |
+| Slower weight growth | `--gamma 1.1 --max-ranking-iter 50` | Residual mode only; avoids 1-step saturation to 1e8 |
+| Manual mandatory groups | `--mandatory-groups "1,5,9"` | Force-include additional high-influence groups for critical element |
+| Higher Phase 1 emphasis | `--critical-weight 100` | Biases group selection (Phase 1) toward the critical element |
+| Feasibility check off | `--no-feasibility-check` | Skips unconstrained OLS at startup (faster, no early warning) |
+
+---
+
+#### 4.3.6 Ranking Mode: `--irls-mode ranking`
+
+**Motivation:** In residual mode, the IRLS weight cap (1×10⁸) causes the OLS to fit element 10058616 exactly, ignoring all other elements. The resulting force vector may amplify other elements' stresses even more, worsening the ranking. The weight saturation is fundamental — a gap of 40 at iter 0 causes the weight to jump to cap in a single step (2^40 × 10 ≈ 10^13 >> cap 10^8).
+
+**Ranking mode formulation:** Given the fixed active support A from Phase 1, the outer loop repeatedly solves:
+
+$$\min_{\mathbf{f}_A} \quad \mathbf{f}_A^\top \mathbf{H}_A^\top \mathbf{H}_A \mathbf{f}_A - 2(\mathbf{H}_A^\top \Delta\boldsymbol{\sigma})^\top \mathbf{f}_A$$
+
+$$\text{subject to:} \quad s_{c_p}(\mathbf{f}_A) - s_b(\mathbf{f}_A) \geq \delta, \quad \forall b \in \text{blockers}(c_p)$$
+
+where:
+- The objective is the global stress range fit (not the critical element fit)
+- **blockers**($c_p$) = elements currently ranked above desired rank $p$ for critical element $c_p$
+- δ = `--ranking-margin` (Pa), default 0
+- $s_e(\mathbf{f}_A)$ = Von Mises stress range proxy at element e
+
+The constraint Jacobian uses precomputed H submatrices (6×|A| per element), so SLSQP inner evaluations involve only trivial matrix-vector products (~6×9 = 54 ops) regardless of the 109,524-row H.
+
+**Comparison:**
+
+| Aspect | `--irls-mode residual` (default) | `--irls-mode ranking` |
+|--------|----------------------------------|----------------------|
+| Objective | Match Δσ at critical element via weight | Match Δσ globally; ranking via constraints |
+| Weight saturation | Yes (2^gap can hit 1e8 in 1 step) | No weights — direct margin constraints |
+| Error at convergence | May explode to 98.6% | Stays near Phase 1 level (~31%) |
+| When ranking improves | When basis spans element well | When feasible under the active basis |
+| Best use case | Basis is adequate; need stress accuracy too | Ranking is primary goal; accept fit error stays constant |
+
+**CLI example for ranking mode:**
+```powershell
+python scripts/fatigue_lasso_pipeline.py `
+    --irls-mode ranking `
+    --ranking-margin 0 `
+    --max-active-groups 6 `
+    --auto-mandatory-top-k 2 `
+    --critical-elems 10058616 `
+    --target-ranking 10058616 `
+    --output-dir outputs/cradle_ranking_mode
+```
 
 ---
 
