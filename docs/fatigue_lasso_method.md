@@ -469,6 +469,58 @@ python scripts/fatigue_lasso_pipeline.py `
 | `run_log_<ts>.txt` | Full metadata: file hashes, H shape, alpha, errors, IRLS history |
 | `report_<ts>.md` | Human-readable summary with ranking table |
 
+### 5.5 Stress Tensor Comparison Tool — Metric Selection
+
+#### Component anatomy
+
+The pipeline's influence matrix **H** stores exactly 6 stress components per element:
+`XX1, YY1, XY1, XX2, YY2, XY2` (top face then bottom face of each shell element).
+These are the rows that the LASSO objective directly matches.
+
+**VON (Von Mises)** is NOT a row of H. It is a derived scalar computed by the FE solver:
+`σ_VM = √(σ_xx² + σ_yy² − σ_xx·σ_yy + 3τ_xy²)`, independently per face.
+The pipeline never optimises against VON. The comparison tool reports it as an informational
+cross-check — good tensor-component accuracy generally implies good VON accuracy, but not vice
+versa. VON is therefore plotted separately from the 6 primary components.
+
+#### Per-component metric rationale
+
+| Metric | Formula | Why it matters for fatigue |
+|--------|---------|---------------------------|
+| MAE (MPa) | mean(\|result − target\|) | Absolute bias in stress magnitude; directly interpretable in engineering units |
+| RMSE (MPa) | √mean((result − target)²) | Penalises large outliers more than MAE; important because S-N curves use power-law exponents m = 3–5, so large errors in high-stress elements cause disproportionate damage error |
+| Max AE (MPa) | max(\|result − target\|) | Worst-case single-element error; the rank-1 critical element must not carry a large Max AE |
+| R² | 1 − SS_res/SS_tot | Explained variance across all elements; near-1.0 means the spatial stress pattern is preserved — necessary for correct element ranking |
+| Pearson r | corr(target, result) | Linear correlation; near-1 even when a systematic scale bias (MAE > 0) exists — distinguishes poor correlation from a well-correlated but offset result |
+| MAPE (%) | mean(\|diff/target\|)×100, \|target\| ≥ 1 µMPa | Relative error; useful for components with very different magnitudes (e.g., XY shear vs XX normal stress) |
+
+**Why it matters**: fatigue damage scales as ~Δσ^m (m ≈ 3–5). A 10% MAPE error in stress propagates to a ~30–60% error in damage — this amplification motivates reporting both MAPE and RMSE alongside R².
+
+#### Bland-Altman agreement plots
+
+Bland-Altman (mean vs. difference) is a method-agreement analysis beyond scatter plots. It reveals:
+- **Constant bias**: the bias line is not at zero → systematic offset in all elements.
+- **Proportional bias**: funnel shape → errors scale with stress magnitude.
+- **Limits of agreement (LoA)**: ±1.96σ envelope. If LoA are within engineering tolerance (typically ±5% of the material yield stress), the two stress fields are considered equivalent.
+
+Two datasets can have R² = 0.999 yet a systematic +50 MPa offset; Bland-Altman makes this immediately visible. For the fatigue comparison, bias should be near zero and the LoA should be well within the stress range of the critical elements.
+
+#### ECDF of absolute relative error
+
+The ECDF plot shows the distribution of per-element relative errors across all elements, not just a summary statistic. Reference lines at 5% and 10% allow the reader to read off "what fraction of elements have error ≤ X%". This is important for fatigue validation:
+
+> The pipeline's objective is to preserve damage **ranking**, not to achieve globally small error. A small fraction of elements at very high relative error could be exactly the critical elements. The ECDF exposes this outlier fraction at a glance, while mean metrics (MAE, RMSE) would hide it.
+
+#### Recommended additional metric (not yet implemented)
+
+For single-subcase comparisons (comparing one MAX or MIN subcase), the existing metrics are appropriate. When two subcases (MAX + MIN) are available, the most direct fatigue fidelity metric is the **Spearman rank correlation of the per-element stress range proxy**:
+
+```
+ρ_s = Spearman( rank(Δσ_VM_result), rank(Δσ_VM_target) )
+```
+
+where `Δσ_VM[e] = σ_VM_max[e] − σ_VM_min[e]`. `ρ_s` close to 1 means the pipeline correctly preserves the damage ranking across all elements — the primary objective of the fatigue LASSO. This metric should be added to `compare_stress_tensors.py` when dual-subcase comparison mode is supported.
+
 ---
 
 ## 6. Theoretical Properties

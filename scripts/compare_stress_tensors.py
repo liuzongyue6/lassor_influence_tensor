@@ -221,8 +221,43 @@ def _density_scatter(ax, x: np.ndarray, y: np.ndarray, cmap: str = "viridis", s:
     ax.scatter(x[order], y[order], c=density[order], cmap=cmap, s=s, alpha=0.7, linewidths=0)
 
 
-# Fig 1: scatter grid
-def plot_scatter_grid(
+# Fig 1a: Von Mises scatter (single panel)
+def plot_von_scatter(
+    path: str,
+    target: np.ndarray,
+    result: np.ndarray,
+    per_comp: list,
+    n_elements: int,
+) -> None:
+    _paper_style()
+    n = len(COMPONENT_ORDER)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    t, r = target[0::n], result[0::n]
+    _density_scatter(ax, t, r)
+    lo = min(t.min(), r.min())
+    hi = max(t.max(), r.max())
+    pad = (hi - lo) * 0.05 or 0.5
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", lw=0.8, zorder=5)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Target (MPa)", fontsize=8)
+    ax.set_ylabel("Result (MPa)", fontsize=8)
+    m = per_comp[0]
+    ax.text(
+        0.04, 0.96,
+        f"R² = {m['r2']:.4f}\nRMSE = {m['rmse']:.3f} MPa\nN = {n_elements:,}",
+        transform=ax.transAxes, fontsize=8, va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
+    )
+    fig.suptitle("Von Mises — Target vs Result", fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Fig 1b: tensor component scatter grid (2×3, top face / bottom face rows)
+def plot_tensor_scatter_grid(
     path: str,
     target: np.ndarray,
     result: np.ndarray,
@@ -232,11 +267,12 @@ def plot_scatter_grid(
 ) -> None:
     _paper_style()
     n = len(COMPONENT_ORDER)
-    fig, axes = plt.subplots(2, 4, figsize=(11, 6))
+    fig, axes = plt.subplots(2, 3, figsize=(9, 6))
     flat = axes.flatten()
 
-    for i, comp in enumerate(COMPONENT_ORDER):
-        ax = flat[i]
+    for k, i in enumerate(range(1, 7)):
+        ax = flat[k]
+        comp = COMPONENT_ORDER[i]
         t, r = target[i::n], result[i::n]
         _density_scatter(ax, t, r)
         lo = min(t.min(), r.min())
@@ -257,40 +293,57 @@ def plot_scatter_grid(
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
         )
 
-    ax_sum = flat[7]
-    ax_sum.axis("off")
-    txt = (
-        "Global Summary\n"
-        "─" * 22 + "\n"
-        f"N elements : {n_elements:,}\n"
-        f"MAE        : {global_m['mae']:.4f} MPa\n"
-        f"RMSE       : {global_m['rmse']:.4f} MPa\n"
-        f"Max AE     : {global_m['max_ae']:.4f} MPa\n"
-        f"R²         : {global_m['r2']:.5f}\n"
-        f"Pearson r  : {global_m['pearson']:.5f}\n"
-        f"MAPE       : {global_m['mape']:.3f} %"
+    fig.suptitle(
+        "Tensor Components — Target vs Result\n"
+        f"N={n_elements:,}  MAE={global_m['mae']:.3f} MPa  "
+        f"RMSE={global_m['rmse']:.3f} MPa  R²={global_m['r2']:.5f}",
+        fontsize=9, fontweight="bold",
     )
-    ax_sum.text(
-        0.05, 0.95, txt, transform=ax_sum.transAxes, fontsize=8,
-        va="top", fontfamily="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", fc="#f5f5f5", ec="#bbbbbb"),
-    )
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
 
-    fig.suptitle("Target vs Result Stress — Component Scatter", fontsize=10, fontweight="bold")
+
+# Fig 2a: Von Mises Bland-Altman (single panel)
+def plot_von_bland_altman(path: str, target: np.ndarray, result: np.ndarray) -> None:
+    _paper_style()
+    n = len(COMPONENT_ORDER)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    t, r = target[0::n], result[0::n]
+    mean_val = (t + r) / 2.0
+    diff = r - t
+    bias = float(np.mean(diff))
+    sigma = float(np.std(diff, ddof=1))
+    loa_hi = bias + 1.96 * sigma
+    loa_lo = bias - 1.96 * sigma
+    ax.scatter(mean_val, diff, s=3, alpha=0.35, color="#2171b5", linewidths=0)
+    ax.axhline(bias, color="black", lw=1.0)
+    ax.axhline(loa_hi, color="#d62728", lw=0.8, linestyle="--")
+    ax.axhline(loa_lo, color="#d62728", lw=0.8, linestyle="--")
+    ax.set_xlabel("Mean (MPa)", fontsize=8)
+    ax.set_ylabel("Difference (MPa)", fontsize=8)
+    ax.text(
+        0.04, 0.96,
+        f"Bias={bias:+.3f}\n+1.96σ={loa_hi:.3f}\n−1.96σ={loa_lo:.3f}",
+        transform=ax.transAxes, fontsize=8, va="top",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
+    )
+    fig.suptitle("Bland-Altman Agreement — Von Mises", fontsize=10, fontweight="bold")
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
 
-# Fig 2: Bland-Altman grid
-def plot_bland_altman_grid(path: str, target: np.ndarray, result: np.ndarray) -> None:
+# Fig 2b: tensor component Bland-Altman grid (2×3)
+def plot_tensor_bland_altman_grid(path: str, target: np.ndarray, result: np.ndarray) -> None:
     _paper_style()
     n = len(COMPONENT_ORDER)
-    fig, axes = plt.subplots(2, 4, figsize=(11, 6))
+    fig, axes = plt.subplots(2, 3, figsize=(9, 6))
     flat = axes.flatten()
 
-    for i, comp in enumerate(COMPONENT_ORDER):
-        ax = flat[i]
+    for k, i in enumerate(range(1, 7)):
+        ax = flat[k]
+        comp = COMPONENT_ORDER[i]
         t, r = target[i::n], result[i::n]
         mean_val = (t + r) / 2.0
         diff = r - t
@@ -298,7 +351,6 @@ def plot_bland_altman_grid(path: str, target: np.ndarray, result: np.ndarray) ->
         sigma = float(np.std(diff, ddof=1))
         loa_hi = bias + 1.96 * sigma
         loa_lo = bias - 1.96 * sigma
-
         ax.scatter(mean_val, diff, s=3, alpha=0.35, color="#2171b5", linewidths=0)
         ax.axhline(bias, color="black", lw=1.0)
         ax.axhline(loa_hi, color="#d62728", lw=0.8, linestyle="--")
@@ -313,8 +365,7 @@ def plot_bland_altman_grid(path: str, target: np.ndarray, result: np.ndarray) ->
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
         )
 
-    flat[7].axis("off")
-    fig.suptitle("Bland-Altman Agreement — Component-wise", fontsize=10, fontweight="bold")
+    fig.suptitle("Bland-Altman Agreement — Tensor Components", fontsize=10, fontweight="bold")
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -427,23 +478,28 @@ def main() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S") if args.timestamp else ""
     suf = f"_{ts}" if ts else ""
 
-    report_path = os.path.join(args.output_dir, f"compare_report{suf}.txt")
-    metrics_csv = os.path.join(args.output_dir, f"compare_metrics{suf}.csv")
-    scatter_png = os.path.join(args.output_dir, f"compare_scatter_grid{suf}.png")
-    ba_png = os.path.join(args.output_dir, f"compare_bland_altman{suf}.png")
-    bar_png = os.path.join(args.output_dir, f"compare_component_metrics{suf}.png")
-    ecdf_png = os.path.join(args.output_dir, f"compare_ecdf{suf}.png")
+    report_path       = os.path.join(args.output_dir, f"compare_report{suf}.txt")
+    metrics_csv       = os.path.join(args.output_dir, f"compare_metrics{suf}.csv")
+    von_scatter_png   = os.path.join(args.output_dir, f"compare_von_scatter{suf}.png")
+    tensor_scatter_png = os.path.join(args.output_dir, f"compare_tensor_scatter_grid{suf}.png")
+    von_ba_png        = os.path.join(args.output_dir, f"compare_von_bland_altman{suf}.png")
+    tensor_ba_png     = os.path.join(args.output_dir, f"compare_tensor_bland_altman{suf}.png")
+    bar_png           = os.path.join(args.output_dir, f"compare_component_metrics{suf}.png")
+    ecdf_png          = os.path.join(args.output_dir, f"compare_ecdf{suf}.png")
 
     write_report(report_path, args.target, args.result,
                  target_subcase, result_subcase, len(ref_ids), global_m, per_comp)
     write_metrics_csv(metrics_csv, per_comp)
-    plot_scatter_grid(scatter_png, target_vec, result_vec, per_comp, global_m, len(ref_ids))
-    plot_bland_altman_grid(ba_png, target_vec, result_vec)
+    plot_von_scatter(von_scatter_png, target_vec, result_vec, per_comp, len(ref_ids))
+    plot_tensor_scatter_grid(tensor_scatter_png, target_vec, result_vec, per_comp, global_m, len(ref_ids))
+    plot_von_bland_altman(von_ba_png, target_vec, result_vec)
+    plot_tensor_bland_altman_grid(tensor_ba_png, target_vec, result_vec)
     plot_component_metrics(bar_png, per_comp)
     plot_ecdf(ecdf_png, target_vec, result_vec)
 
     print(f"Outputs written to: {args.output_dir}")
-    for p in (report_path, metrics_csv, scatter_png, ba_png, bar_png, ecdf_png):
+    for p in (report_path, metrics_csv, von_scatter_png, tensor_scatter_png,
+              von_ba_png, tensor_ba_png, bar_png, ecdf_png):
         print(f"  {os.path.basename(p)}")
 
 
