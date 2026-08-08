@@ -5,12 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```powershell
-# Coupon smoke-test (24 elements, fast)
-python scripts/ir_lasso_pipeline.py --mode stress `
-  --ir-strs InfluenceMatrix/Coupon/LE5Quad4_Inertia_Relief_Target_Stress.txt `
-  --spc-strs InfluenceMatrix/Coupon/LE5Quad4_SPC_Unit_Load_Stress.txt
-
-# Cradle HAZ fatigue pipeline (18 254 elements, ~minutes)
+# Cradle HAZ fatigue pipeline — V2, global-fit + ranking refinement (18 254 elements, ~minutes)
 python scripts/fatigue_lasso_pipeline.py `
   --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
   --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
@@ -19,6 +14,17 @@ python scripts/fatigue_lasso_pipeline.py `
   --critical-elems 10058616,10014072 `
   --target-ranking 10058616,10014072 `
   --output-dir outputs/cradle_run
+
+# Cradle HAZ fatigue pipeline — V3, critical-ranked local-fit (use when V2's global-fit
+# group selection starves the critical elements — see docs/fatigue_lasso_method.md §5)
+python scripts/fatigue_ranking_pipeline.py `
+  --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+  --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+  --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
+  --max-active-groups 4 --auto-mandatory-top-k 2 `
+  --critical-elems 10058616,10014072 `
+  --target-ranking 10058616,10014072 `
+  --output-dir outputs/ranking_run
 
 # Compare two stress tensors visually
 python scripts/compare_stress_tensors.py `
@@ -29,18 +35,29 @@ python scripts/compare_stress_tensors.py `
 python -c "import ast; ast.parse(open('scripts/fatigue_lasso_pipeline.py').read()); print('OK')"
 ```
 
+> **Note**: `scripts/ir_lasso_pipeline.py` (legacy single-subcase Coupon pipeline) was removed from the
+> repo in commit `1739a03`. There is currently no runnable Coupon smoke-test — both remaining
+> pipelines require a MAX **and** MIN subcase pair (they fit stress *range*, not absolute stress). See
+> `docs/fatigue_lasso_method.md` Appendix A for the historical Coupon workflow this replaced.
 
 ## Architecture
 
-Two independent pipelines share the same STRS parser and matrix-building helpers:
+Three scripts share the same STRS parser and matrix-building helpers (all defined in
+`fatigue_lasso_pipeline.py`; `fatigue_ranking_pipeline.py` imports them):
 
 ```
-ir_lasso_pipeline.py          — single-subcase LASSO (original, Coupon / simple cases)
-fatigue_lasso_pipeline.py     — dual-subcase fatigue pipeline (Cradle HAZ, production use)
-compare_stress_tensors.py     — visualisation utility, no optimisation
+fatigue_lasso_pipeline.py     — V2: dual-subcase fatigue pipeline, global-fit Phase 1 + Phase 3
+                                 ranking refinement (residual IRLS or ranking SLSQP mode).
+                                 Production default; all new work starts here.
+fatigue_ranking_pipeline.py   — V3: dual-subcase, Phase 1 fitted on CRITICAL ELEMENT ROWS ONLY,
+                                 Phase 3 is always local-fit SLSQP. Use when V2's global-fit group
+                                 selection can't cover the critical elements (basis insufficiency).
+compare_stress_tensors.py     — visualisation/validation utility, no optimisation
 ```
 
-### Data Flow (fatigue pipeline)
+Full V2-vs-V3 comparison table and guidance on which to use: `docs/fatigue_lasso_method.md` §5.
+
+### Data Flow (V2 — `fatigue_lasso_pipeline.py`)
 
 ```
 STRS files
@@ -65,6 +82,15 @@ Recovery f_max = f_mean + f_range/2
 ```
 
 `active_mask_fixed` being immutable throughout Phase 3 is the key V2 invariant. Any change that re-runs group selection inside the IRLS loop will re-introduce the 139% error-explosion bug from V1.
+
+### Data Flow (V3 — `fatigue_ranking_pipeline.py`)
+
+Same shape as V2, with two changes: Phase 1 is fitted on `H[crit_row_mask]` /
+`delta_sigma[crit_row_mask]` (critical elements' rows only, not all m rows), and Phase 3 is always
+`solve_local_ranking()` — SLSQP minimizing the **local** (critical-rows-only) residual subject to
+ranking constraints, instead of V2's IRLS weight-boosting or global-fit SLSQP. `active_mask_fixed` is
+still locked after Phase 1 and never reopened — the same invariant, same reason. Phase 0 and Phase 2
+are the literal same functions as V2 (imported, not reimplemented).
 
 ## STRS File Format and Parsing
 
@@ -91,10 +117,9 @@ A **force group** is always 3 consecutive columns in H (since columns are sorted
 
 | Path | Role |
 |------|------|
-| `scripts/fatigue_lasso_pipeline.py` | Production pipeline; all new work goes here |
-| `scripts/ir_lasso_pipeline.py` | Legacy single-subcase pipeline; keep backward-compatible |
-| `docs/fatigue_lasso_method.md` | Full mathematical write-up (paper draft) |
-| `docs/ir_lasso_workflow.md` | Original workflow spec for the Coupon case |
+| `scripts/fatigue_lasso_pipeline.py` | V2 production pipeline (global-fit); all new work starts here unless V3 is specifically needed |
+| `scripts/fatigue_ranking_pipeline.py` | V3 pipeline (critical-ranked local-fit); imports shared helpers from `fatigue_lasso_pipeline.py` |
+| `docs/fatigue_lasso_method.md` | Single developer-facing reference: math, algorithm, CLI, and diagnostics for V1 (historical, Appendix A), V2, and V3 |
 | `InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress_Damage.csv` | Ground-truth fatigue ranking (element 10058616 = rank 1) |
 
 ## Dependencies

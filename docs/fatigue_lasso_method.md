@@ -1,7 +1,29 @@
 # Load Channel Reduction for Block Cycle Fatigue Testing via Influence Tensor and Group LASSO
 
-> **Document purpose**: Technical reference — method derivation, algorithmic design, validation evidence.
-> **Last updated**: 2026-08-03
+> **Document purpose**: Single developer-facing technical reference for every load-channel-reduction
+> pipeline in this repo — method derivation, algorithmic design, CLI usage, and validation evidence.
+> **Scope**: Merged from `fatigue_lasso_method.md` (V2 reference/research log) and the former
+> `docs/ir_lasso_workflow.md` (legacy V1 Coupon workflow) on 2026-08-08, and extended with the V3
+> critical-ranked local-fit pipeline (`scripts/fatigue_ranking_pipeline.py`).
+> **Last updated**: 2026-08-08
+
+---
+
+## 0. Pipeline Versions at a Glance
+
+Three generations of the channel-reduction algorithm exist in this repo. They share the same STRS
+parser and matrix-building helpers (all defined once in `fatigue_lasso_pipeline.py` and imported by
+the others) but differ in what each optimizes.
+
+| Version | Script | Status | Target | Optimizes |
+|---|---|---|---|---|
+| **V1** | `scripts/ir_lasso_pipeline.py` | **Removed from repo** (commit `1739a03`) — documented here for historical context only | Single-subcase absolute stress (Coupon, 24 elements) | Plain LASSO: `min ½‖Hf−σ_target‖² + α‖f‖₁` |
+| **V2** | `scripts/fatigue_lasso_pipeline.py` | **Active — primary production pipeline** | Dual-subcase stress *range* Δσ (Cradle HAZ, 18,254 elements) | Group LASSO on Δσ globally (all rows), ranking enforced as a Phase-3 refinement on top of a global fit |
+| **V3** | `scripts/fatigue_ranking_pipeline.py` | **Active — critical-ranked local-fit variant** | Same dual-subcase Δσ input | Group LASSO restricted to critical-element rows only; global fit is not optimized, only reported |
+
+V1 is retained here only as historical reference (§10, Appendix A) because its script no longer exists
+and its replacement in the current workflow is V2. **For any new work, use V2 or V3** — see §5.8 for
+guidance on choosing between them.
 
 ---
 
@@ -71,7 +93,7 @@ The target event (subcases 1000001/1000002) represents the inertia-relief (IR) r
 
 ---
 
-## 2. Mathematical Formulation
+## 2. Mathematical Formulation (V2)
 
 ### 2.1 Notation
 
@@ -94,7 +116,7 @@ The SPC unit-load library is organized by **force groups**: each attachment poin
 
 This group structure is the motivation for **Group LASSO** rather than elementwise LASSO: the sparsity penalty acts on groups of three columns simultaneously, producing solutions where entire attachment-point triplets are either fully active or fully zero.
 
-Group index g occupies columns `[3g, 3g+1, 3g+2]` in H (columns sorted by subcase ID). This alignment is preserved throughout the algorithm.
+Group index g occupies columns `[3g, 3g+1, 3g+2]` in H (columns sorted by subcase ID). This alignment is preserved throughout the algorithm and is shared by V2 and V3.
 
 ### 2.3 Phase 1 — Stress Range Matching via Group LASSO
 
@@ -104,11 +126,13 @@ $$\mathbf{f}^*_{\text{range}} = \arg\min_{\mathbf{f}} \;\frac{1}{2m}\|\mathbf{W}
 
 where **f**_g = (F_X^g, F_Y^g, F_Z^g) is the force triplet for attachment point g, and λ controls group sparsity.
 
-**Active group set**: A = {g : ‖**f**_g‖₂ > ε}.  
-**Group count control**: λ is selected via binary search on log(λ) to enforce |A| ≤ K.  
+**Active group set**: A = {g : ‖**f**_g‖₂ > ε}.
+**Group count control**: λ is selected via binary search on log(λ) to enforce |A| ≤ K.
 **Relaxed OLS**: after selecting A, refit without penalty to remove LASSO shrinkage bias:
 
 $$\hat{\mathbf{f}}_{\text{range}} = \arg\min_{\mathbf{f}: \operatorname{supp}(\mathbf{f}) \subseteq A} \|\mathbf{W}(\mathbf{H}\mathbf{f} - \Delta\boldsymbol{\sigma})\|_2^2$$
+
+**V3 note**: V3's Phase 1 solves this identical formulation but with `H` and `Δσ` restricted to critical-element rows only — see §5.2.
 
 ### 2.4 Phase 0 — Influence-Guided Mandatory Channel Pre-Selection
 
@@ -128,6 +152,8 @@ BCD alternates:
 
 Final joint OLS on all selected columns removes shrinkage bias.
 
+**Precision note on "guarantee"**: Phase 0 guarantees a *necessary* condition — that the active set contains channels with non-zero influence on the critical elements, so the force basis is not degenerate for them. It does **not** guarantee a *sufficient* condition — that some amplitude combination on that basis achieves the target damage *rank*. Whether the target rank is achievable at all is a separate, harder question (**basis insufficiency**, §4.3.3); Phase 0 only rules out the trivial failure mode of a critical element having zero excitation from every active channel.
+
 **Rationale**: if the Group LASSO freely optimises the global error, it may select attachment points that produce accurate stress at the majority of elements while contributing near-zero stress at the critical element — leaving no force basis to excite it regardless of amplitude. Phase 0 prevents this by guaranteeing coverage of the critical elements.
 
 ### 2.5 Phase 2 — Mean Stress Identification
@@ -136,19 +162,19 @@ After Phase 1 locks the active set A, recover **f_mean** on the same support:
 
 $$\mathbf{f}^*_{\text{mean}} = \arg\min_{\mathbf{f}: \operatorname{supp}(\mathbf{f}) \subseteq A} \|\mathbf{W}(\mathbf{H}\mathbf{f} - \boldsymbol{\sigma}_{\text{mean}})\|_2^2$$
 
-This is weighted Ridge (α = 1×10⁻⁸ for numerical stability) on the active columns. Restricting to the same support as Phase 1 enforces physical consistency: the block cycle MAX and MIN loads are applied at the same attachment points, with different magnitudes.
+This is weighted Ridge (α = 1×10⁻⁸ for numerical stability) on the active columns. Restricting to the same support as Phase 1 enforces physical consistency: the block cycle MAX and MIN loads are applied at the same attachment points, with different magnitudes. V3 reuses this exact function (`solve_phase2_mean`) unchanged.
 
 ### 2.6 Block Cycle Load Recovery
 
 $$\mathbf{f}_{\text{max}} = \mathbf{f}_{\text{mean}} + \frac{\mathbf{f}_{\text{range}}}{2}, \qquad \mathbf{f}_{\text{min}} = \mathbf{f}_{\text{mean}} - \frac{\mathbf{f}_{\text{range}}}{2}$$
 
-These two force vectors define one complete block cycle: apply f_max to the test rig (MAX load block), then apply f_min (MIN load block). Repeat for the specified number of cycles.
+These two force vectors define one complete block cycle: apply f_max to the test rig (MAX load block), then apply f_min (MIN load block). Repeat for the specified number of cycles. Identical in V2 and V3.
 
-### 2.7 Phase 3 — Damage Ranking Refinement (Fixed-Support IRLS)
+### 2.7 Phase 3 — Damage Ranking Refinement (Fixed-Support IRLS / SLSQP)
 
-If the initial Phase 1 solution does not achieve the target damage ranking, Phase 3 runs an Iterative Re-weighted Least Squares (IRLS) loop on the **fixed support** from Phase 1.
+If the initial Phase 1 solution does not achieve the target damage ranking, Phase 3 runs an iterative refinement loop on the **fixed support** from Phase 1.
 
-**Critical invariant**: the active set A is frozen after Phase 1. Phase 3 only adjusts force amplitudes within A. Re-running the group selection inside the IRLS loop causes catastrophic error explosion (see §4.1).
+**Critical invariant** (shared by V2 and V3): the active set A is frozen after Phase 1. Phase 3 only adjusts force amplitudes within A. Re-running the group selection inside the refinement loop causes catastrophic error explosion (see §4.1).
 
 ```
 For iteration k = 1..max_iter:
@@ -165,9 +191,11 @@ For iteration k = 1..max_iter:
     if no improvement for 3 consecutive iterations: break
 ```
 
-Two modes are available (see §4.3.6):
-- **Residual mode** (default): IRLS weight boosting drives the OLS to fit the critical element's Δσ more tightly
-- **Ranking mode**: SLSQP constrained optimisation with explicit margin constraints on the damage ordering
+V2 offers two modes (§4.3.6):
+- **Residual mode** (default): IRLS weight boosting — drives the OLS to fit the critical element's Δσ more tightly
+- **Ranking mode**: SLSQP constrained optimisation with explicit margin constraints on the damage ordering, objective = **global** Δσ fit
+
+V3 always uses a variant of the SLSQP approach, but with a **local** fit objective restricted to critical-element rows — see §5.3.
 
 ### 2.8 Damage Proxy
 
@@ -177,11 +205,11 @@ $$s_e = \max\!\left(
   \sqrt{\Delta\sigma_{XX}^2 + \Delta\sigma_{YY}^2 - \Delta\sigma_{XX}\Delta\sigma_{YY} + 3\Delta\sigma_{XY}^2}
 \right)_{\text{face 1, face 2}}$$
 
-This proxy is monotonically related to Palmgren-Miner fatigue damage for an S-N curve with exponent m = 3–5, making it a reliable ranking signal without requiring full rainflow counting at each IRLS iteration.
+This proxy is monotonically related to Palmgren-Miner fatigue damage for an S-N curve with exponent m = 3–5, making it a reliable ranking signal without requiring full rainflow counting at each IRLS iteration. Shared unchanged by V2 and V3 (`compute_von_mises_range`, `_vm_single`).
 
 ---
 
-## 3. Algorithm Summary
+## 3. Algorithm Summary (V2)
 
 ```
 INPUT:
@@ -226,9 +254,14 @@ OUTPUT:
   run_log_*.txt              — full metadata, H shape, α, errors, IRLS history
 ```
 
+Note the **execution order is Phase 0 → Phase 1 → Phase 3 → Phase 2**, not the numeric order the phase
+names suggest — Phase 3 (ranking refinement) runs before Phase 2 (mean stress) in code, because Phase 2
+only needs the *locked active set*, which Phase 3 does not change. See `run_fatigue_pipeline()` in
+`scripts/fatigue_lasso_pipeline.py`.
+
 ---
 
-## 4. Diagnostic Evidence and Design Decisions
+## 4. Diagnostic Evidence and Design Decisions (V2)
 
 ### 4.1 V1 Failure Mode: IRLS with Re-Running Group Selection
 
@@ -332,6 +365,10 @@ If the column structure of H[:, A] systematically excites other elements more th
 
 **Physical interpretation**: element 10058616 ranks #1 in the target event likely due to distributed inertia body-load components that produce a specific spatial stress pattern. Point-force SPC channels produce a fundamentally different spatial distribution, where other structural elements (e.g., 10032399 near a stiffness discontinuity) are more excited by any linear combination of attachment-point forces.
 
+This is also the design motivation for **V3** (§5): restricting the Phase 1 fitting objective to the
+critical element's own rows makes group selection directly optimize for coverage of that element,
+rather than relying on global-fit group selection to happen to cover it well.
+
 ---
 
 #### 4.3.4 Self-Diagnostic Signals
@@ -343,7 +380,7 @@ If the column structure of H[:, A] systematically excites other elements more th
 | `[WARNING] IRLS never improved…` | console | Post-loop warning with gap details |
 | `[WARNING] Phase 0 feasibility: elem … ranks …` | console | Unconstrained OLS (all groups) also fails → fundamental basis insufficiency |
 
-The `--feasibility-check` flag (default: on) runs unconstrained OLS (all G groups, no sparsity) before Phase 1. If element 10058616 cannot rank #1 even with all channels, no sparse selection can achieve it.
+The `--feasibility-check` flag (default: on) runs unconstrained OLS (all G groups, no sparsity) before Phase 1. If element 10058616 cannot rank #1 even with all channels, no sparse selection can achieve it. Both V2 and V3 implement this check identically.
 
 ---
 
@@ -352,15 +389,16 @@ The `--feasibility-check` flag (default: on) runs unconstrained OLS (all G group
 | Strategy | CLI parameter | Expected effect |
 |----------|--------------|----------------|
 | More active groups | `--max-active-groups 6` (or 8, 10, 15) | Larger force basis |
-| Switch to ranking mode | `--irls-mode ranking` | Avoids weight saturation |
+| Switch to ranking mode | `--irls-mode ranking` (V2 only) | Avoids weight saturation |
+| Switch algorithm entirely | Use V3 (`fatigue_ranking_pipeline.py`) | Group selection itself targets critical-element coverage, not just amplitude refinement |
 | Unconstrained feasibility test | `--max-active-groups 15` | Determines whether target rank is achievable at all |
-| Slower weight growth | `--gamma 1.1 --max-ranking-iter 50` | Residual mode: avoids 1-step saturation |
+| Slower weight growth | `--gamma 1.1 --max-ranking-iter 50` (V2 residual mode) | Avoids 1-step saturation |
 | Manual mandatory groups | `--mandatory-groups "1,5,9"` | Force-include specific high-influence channels |
 | Higher Phase 1 emphasis | `--critical-weight 100` | Biases group selection toward the critical element |
 
 ---
 
-#### 4.3.6 Ranking Mode: Direct Constraint Optimisation
+#### 4.3.6 Ranking Mode: Direct Constraint Optimisation (V2)
 
 **Motivation**: in residual mode, a rank-gap of 40 at iteration 0 drives the weight to 2^40 × 10 ≈ 10¹³, immediately hitting the cap (10⁸) in one step. The capped OLS forces the critical element's stress upward but simultaneously amplifies competitor elements even more — worsening the rank.
 
@@ -374,33 +412,212 @@ where **blockers**($c_p$) = elements currently ranked above desired rank $p$ for
 
 The constraint Jacobian uses precomputed H submatrices (6×|A| per element), so SLSQP evaluations involve only small matrix-vector products regardless of the full 109,524-row H.
 
-| Aspect | Residual mode (default) | Ranking mode |
-|--------|------------------------|--------------|
-| Objective | Fit critical element Δσ via weight | Fit Δσ globally; ranking via constraints |
-| Weight saturation | Yes — 1-step saturation possible | No weights |
-| Error at convergence | May explode to 98.6% | Stays near Phase 1 level |
-| Best use case | Basis spans element well; stress accuracy needed | Ranking is primary goal |
+| Aspect | Residual mode (default) | Ranking mode | V3 (always) |
+|--------|------------------------|---------------|--------------|
+| Objective | Fit critical element Δσ via weight | Fit Δσ globally; ranking via constraints | Fit Δσ **at critical elements only**; ranking via constraints |
+| Weight saturation | Yes — 1-step saturation possible | No weights | No weights |
+| Error at convergence | May explode to 98.6% | Stays near Phase 1 level (global) | Global error uncontrolled (informational only); local error is the controlled quantity |
+| Best use case | Basis spans element well; stress accuracy needed | Ranking is primary goal, global fidelity still wanted | Ranking is the *only* goal; global fidelity not required |
 
 ---
 
-## 5. Implementation
+## 5. V3 — Critical-Ranked Local-Fit Pipeline (`scripts/fatigue_ranking_pipeline.py`)
 
-### 5.1 Key Functions
+### 5.1 Motivation
 
-| Function | Role |
-|---------|------|
-| `parse_subcases()` | Parse OptiStruct STRS text format; extract per-element stress components |
-| `build_matrix()` | Assemble H ∈ ℝ^(m×n) from SPC subcases; scale by unit load magnitude |
-| `compute_group_influence()` | Frobenius norm of H submatrix per (critical_element, force_group) |
-| `solve_bcd()` | Block Coordinate Descent: OLS (mandatory) + Group LASSO (free) |
-| `find_alpha_for_k_groups()` | Binary search on log(λ) to enforce ≤ K active groups |
-| `_weighted_ols_fixed_support()` | Weighted Ridge-OLS on a fixed column mask; no group selection |
-| `solve_phase1_with_ranking()` | Orchestrates Phase 1 (BCD or LASSO) + Phase 3 IRLS |
-| `compute_von_mises_range()` | Per-element damage proxy from Δσ tensor |
-| `solve_phase2_mean()` | Restricted OLS for f_mean on Phase-1 active columns |
-| `run_fatigue_pipeline()` | Top-level: Phase 0 → 1 → 3 → 2 → outputs |
+V2's Phase 1 fits Δσ across **all** m = 109,524 rows, then relies on Phase 3 to fix ranking errors
+without reopening group selection. §4.3.3 shows this can fail structurally: if the group selection
+step (driven by the global-fit objective) happens to pick channels that barely excite the 1–2 critical
+elements out of 18,254, no amount of Phase-3 amplitude tuning can fix it — the basis itself is
+insufficient at those specific elements, even though it fits the *global* field well.
 
-### 5.2 CLI Reference
+V3 inverts the priority ordering explicitly:
+
+- **PRIMARY** — critical elements (e.g. 10058616, 10014072) must rank above all others in Von Mises
+  equivalent stress range.
+- **SECONDARY** — predicted stress range at the critical element positions fits the target tensor.
+- **GLOBAL** — global tensor matching (all 18,254 elements) is **not required** and is not optimized;
+  it is reported purely for information.
+
+The mechanism: restrict the *rows* used in Phase 1's Group LASSO to just the critical elements'
+own rows (`n_crit × 6` rows — e.g. 12 rows for 2 critical elements, vs. 109,524 for V2). Group
+selection is then forced to prioritize coverage of exactly those elements, because nothing else is in
+the objective.
+
+### 5.2 Algorithm Differences from V2
+
+| Aspect | V2 (`fatigue_lasso_pipeline.py`) | V3 (`fatigue_ranking_pipeline.py`) |
+|---|---|---|
+| Phase 1 fitting rows | All m rows (global Δσ) | Only critical-element rows: `H_crit = H[crit_row_mask]`, `Δσ_crit = Δσ[crit_row_mask]` |
+| Phase 1 objective | `min ‖W(Hf − Δσ)‖²` over all elements + group-sparsity penalty | `min ‖W(H_crit f − Δσ_crit)‖²` + group-sparsity penalty (same `solve_bcd` / `find_alpha_for_k_groups` machinery, called on the row-restricted system) |
+| Phase 3 objective | Residual mode: IRLS weight boosting on **global** fit. Ranking mode: SLSQP on **global** fit + ranking constraints | SLSQP on **local** fit (critical rows only) + ranking constraints — no residual/weight-boosting mode exists |
+| Global Δσ fit | Primary quality metric (`relative_error_range`) | Reported as `global_error_range`, explicitly labeled "informational, not optimised" in the report template |
+| Local Δσ fit at critical elements | Not tracked separately | Primary quality metric (`local_fit_error_range`) |
+| CLI mode switch | `--irls-mode residual\|ranking` | None — always local-fit SLSQP |
+| Blocker constraint cap | Not capped | `--max-blockers-per-iter` (default 200): caps constraints per SLSQP call, keeping only the worst violators (largest `s_e[blocker] − s_e[crit]`) — needed because with a global element population the blocker set can be large |
+| Already-satisfied higher-priority elements | N/A (V2 doesn't special-case ranking order beyond position) | Explicitly excluded from the blocker set for lower-priority critical elements once they satisfy their own rank (see `solve_local_ranking`, blocker-set pruning) |
+| Phase 0 (mandatory groups, feasibility check) | `compute_group_influence`, unconstrained-OLS feasibility check | **Identical logic**, reused verbatim (imported from `fatigue_lasso_pipeline`) |
+| Phase 2 (mean stress) | `solve_phase2_mean` | **Identical function**, imported and reused unchanged |
+| Module dependency | Self-contained | Imports helpers from `fatigue_lasso_pipeline.py` (sibling import, with a `sys.path` fallback for direct execution) — the two scripts must stay in the same directory |
+
+### 5.3 Phase 1 — Group Selection on Critical Rows
+
+Uses the same `solve_bcd()` / `find_alpha_for_k_groups()` functions as V2, but called with:
+```python
+crit_row_mask = _make_crit_row_mask(ref_ids, all_critical, n_comp)   # True only for critical elems' 6 rows each
+H_crit        = H[crit_row_mask, :]
+delta_crit    = delta_sigma[crit_row_mask]
+weights_crit  = weights_init[crit_row_mask]
+# then solve_bcd(H_crit, delta_crit, weights_crit, ...) or find_alpha_for_k_groups(H_crit, delta_crit, ...)
+```
+The resulting `active_mask` is expanded to whole-group granularity and **locked**, exactly as in V2 —
+the fixed-support invariant (§2.7) is preserved.
+
+### 5.4 Phase 3 — `solve_local_ranking()`
+
+Objective (note: local, not global):
+
+$$\min_{\mathbf{f}_A} \quad \|\mathbf{H}_{\text{crit},A}\,\mathbf{f}_A - \Delta\boldsymbol{\sigma}_{\text{crit}}\|_2^2$$
+
+subject to the same ranking-margin inequality constraints as V2's ranking mode (§4.3.6), evaluated
+against the **full** element population (ranking still needs to be checked against all 18,254
+elements — only the *fit objective* is restricted to critical rows, not the ranking evaluation).
+
+Iteration loop (per call, up to `--max-ranking-iter`):
+1. Evaluate current ranking from `H_active @ f_current` over **all** elements.
+2. For each unsatisfied critical element, collect "blocker" elements currently ranked at or above its
+   desired position (plus anything ranked strictly between desired and actual), sort by worst
+   violation, keep the top `--max-blockers-per-iter`.
+3. Solve SLSQP: minimize the local quadratic objective subject to
+   `VM_crit(f) − VM_blocker(f) ≥ margin` for every collected blocker.
+4. Track the best state seen (`n_satisfied` highest); stop on full satisfaction, 3 iterations without
+   improvement, or `max_iter`.
+
+Because the objective's Hessian (`HtH_crit = H_crit_active.T @ H_crit_active`) is a small
+`n_active × n_active` matrix built once, and constraints only touch 6×n_active submatrices per
+element pair, each SLSQP call is cheap regardless of the 109,524-row full H.
+
+### 5.5 Algorithm Summary (V3)
+
+```
+INPUT: same as V2 (σ_max, σ_min, H, critical_elems, target_ranking, K, K_mand)
+
+PHASE 0 — Influence analysis + mandatory groups          (identical to V2, §3)
+
+PHASE 1 — Group selection on CRITICAL ROWS ONLY (runs ONCE, result is locked)
+  crit_row_mask ← rows belonging to critical_elems
+  H_crit, delta_crit, weights_crit ← H[crit_row_mask], Δσ[crit_row_mask], W[crit_row_mask]
+  If mandatory_groups non-empty:
+    solve_bcd(H_crit, delta_crit, weights_crit, mandatory_groups, K) → active_mask_fixed
+  Else:
+    binary_search(λ) → group_lasso(H_crit, delta_crit, weights_crit, K) → active_mask_fixed
+
+PHASE 3 — SLSQP local-fit ranking refinement (if target_ranking given)
+  For k = 1..max_iter:
+    ranks ← von_mises_ranking(H[:, active_mask_fixed] @ f_current)   # full element population
+    blockers ← worst-violating elements ranked above each unsatisfied critical elem (capped)
+    f_current ← SLSQP minimize ||H_crit[:, active_mask_fixed] @ f - delta_crit||²
+                s.t. VM_crit(f) - VM_blocker(f) >= margin  for each blocker
+    track best state; stop on full satisfaction / 3 no-improve / max_iter
+  If no target_ranking: f_range = Phase 1 coefficients directly (no Phase 3 run)
+
+PHASE 2 — Mean load identification                       (identical to V2, §3)
+  f_mean ← weighted_ols(H[:, active_mask_fixed], σ_mean, W_init)
+
+RECOVERY                                                  (identical to V2)
+  f_max = f_mean + f_range/2
+  f_min = f_mean − f_range/2
+
+OUTPUT:
+  f_range_*.csv, f_mean_*.csv, f_max_*.csv, f_min_*.csv
+  ranking_check_*.csv        — predicted damage rank vs. target rank
+  group_influence_*.csv      — Phase 0 influence scores (when mandatory groups active)
+  run_log_*.txt              — full metadata incl. local_fit_error_range, global_error_range
+  report_*.md                — human-readable summary; explicitly notes global error is informational
+```
+
+### 5.6 CLI Reference (V3)
+
+```powershell
+python scripts/fatigue_ranking_pipeline.py `
+    --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+    --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+    --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
+    --max-active-groups 4 --auto-mandatory-top-k 2 `
+    --critical-elems 10058616,10014072 `
+    --target-ranking 10058616,10014072 `
+    --critical-weight 10.0 `
+    --max-ranking-iter 20 `
+    --output-dir outputs/ranking_v1
+```
+
+**Note (Windows)**: Use PowerShell backtick `` ` `` for line continuation, same caveat as V2 (§4.1
+Root cause 3) — `\` is not a continuation character in PowerShell.
+
+Key CLI differences from V2's `fatigue_lasso_pipeline.py`:
+
+| Parameter | V2 default | V3 default | Notes |
+|---|---|---|---|
+| `--max-active-groups` | `None` (unbounded, grid search) | `6` | V3 requires a bound since it's meaningless to fit critical rows without a group budget |
+| `--irls-mode` | `residual` / `ranking` | *(parameter does not exist)* | V3 has only one Phase-3 mode |
+| `--gamma` | `2.0` | *(parameter does not exist)* | No IRLS weight boosting in V3 |
+| `--max-blockers-per-iter` | *(parameter does not exist)* | `200` | V3-only: caps SLSQP constraint count per iteration |
+| `--ranking-margin` | `0.0` | `0.0` | Same meaning in both |
+| `--alpha-grid` | `"0.1,1,10,100,1000"` | *(parameter does not exist)* | V3 always requires `--max-active-groups`, so it never falls back to grid search |
+
+### 5.7 Output Files (V3)
+
+| File | Content |
+|------|---------|
+| `stress_group_influence_<ts>.csv` | Phase 0: Frobenius norm per (critical_element, group) — identical format to V2 |
+| `stress_f_range_<ts>.csv` | f_range = f_max − f_min per SPC subcase |
+| `stress_f_mean_<ts>.csv` | f_mean = (f_max + f_min)/2 per SPC subcase |
+| `stress_f_max_<ts>.csv` | Block cycle MAX load amplitudes |
+| `stress_f_min_<ts>.csv` | Block cycle MIN load amplitudes |
+| `stress_ranking_check_<ts>.csv` | Per-element damage proxy, predicted rank, target rank |
+| `run_log_<ts>.txt` | Full metadata: file hashes, H shape, α, `local_fit_error_range`, `global_error_range`, ranking diagnostics |
+| `report_<ts>.md` | Human-readable summary (`write_ranking_report`) — explicitly separates local fit error (optimised) from global error (informational) |
+
+Unlike V2, V3 does **not** write `stress_H_*.csv` or `stress_delta_target_*.csv` (the full H matrix and
+target vector dumps) — only the force/ranking outputs.
+
+### 5.8 When to Use V2 vs. V3
+
+| Situation | Recommended pipeline |
+|---|---|
+| Need reasonable global stress-field fidelity (e.g. for downstream full-field FE comparison, or because several non-"critical" elements also matter) | **V2** |
+| V2's Phase 1 basis-insufficiency diagnostic (§4.3.3, `basis_insufficient_warning`) fires, or V2's IRLS `best_iteration: 0` shows global-fit group selection is starving the critical elements | **V3** (or V2 with more active groups / manual mandatory groups first, per §4.3.5, before switching algorithms) |
+| Only 1–3 critical elements' rank order matters, and the block-cycle test's sole acceptance criterion is that ranking | **V3** |
+| Need to compare residual-mode vs. ranking-mode weight/constraint behaviour, or need per-iteration IRLS weight history | **V2** (V3 has no residual mode) |
+
+Both pipelines share Phase 0 and Phase 2 exactly, so switching between them does not change the
+influence-score diagnostics or the mean-stress recovery — only the Phase 1 fitting rows and the
+Phase 3 objective change.
+
+---
+
+## 6. Implementation
+
+### 6.1 Key Functions
+
+| Function | Defined in | Role |
+|---|---|---|
+| `parse_subcases()` | `fatigue_lasso_pipeline.py` | Parse OptiStruct STRS text format; extract per-element stress components |
+| `build_matrix()` | `fatigue_lasso_pipeline.py` | Assemble H ∈ ℝ^(m×n) from SPC subcases; scale by unit load magnitude |
+| `compute_group_influence()` | `fatigue_lasso_pipeline.py` | Frobenius norm of H submatrix per (critical_element, force_group) |
+| `solve_bcd()` | `fatigue_lasso_pipeline.py` | Block Coordinate Descent: OLS (mandatory) + Group LASSO (free); used by both V2 and V3 |
+| `find_alpha_for_k_groups()` | `fatigue_lasso_pipeline.py` | Binary search on log(λ) to enforce ≤ K active groups; used by both V2 and V3 |
+| `_weighted_ols_fixed_support()` | `fatigue_lasso_pipeline.py` | Weighted Ridge-OLS on a fixed column mask; no group selection |
+| `solve_phase1_with_ranking()` | `fatigue_lasso_pipeline.py` | V2 orchestration: Phase 1 (BCD or LASSO) + Phase 3 IRLS/SLSQP (global) |
+| `solve_ranking_constrained()` | `fatigue_lasso_pipeline.py` | V2 ranking mode: SLSQP with global fit objective |
+| `compute_von_mises_range()` | `fatigue_lasso_pipeline.py` | Per-element damage proxy from Δσ tensor; shared by V2 and V3 |
+| `solve_phase2_mean()` | `fatigue_lasso_pipeline.py` | Restricted OLS for f_mean on Phase-1 active columns; shared by V2 and V3 |
+| `run_fatigue_pipeline()` | `fatigue_lasso_pipeline.py` | V2 top-level: Phase 0 → 1 → 3 → 2 → outputs |
+| `_make_crit_row_mask()` | `fatigue_ranking_pipeline.py` | V3-only: boolean row mask selecting only critical elements' rows |
+| `solve_local_ranking()` | `fatigue_ranking_pipeline.py` | V3 Phase 3: SLSQP with local (critical-rows-only) fit objective |
+| `run_ranking_pipeline()` | `fatigue_ranking_pipeline.py` | V3 top-level: Phase 0 → 1 (local) → 3 (local SLSQP) → 2 → outputs |
+
+### 6.2 CLI Reference (V2)
 
 ```powershell
 python scripts/fatigue_lasso_pipeline.py `
@@ -420,7 +637,9 @@ python scripts/fatigue_lasso_pipeline.py `
 
 **Note (Windows)**: Use PowerShell backtick `` ` `` for line continuation. Do NOT use `\`.
 
-### 5.3 Key Hyperparameters
+V3's CLI reference is in §5.6.
+
+### 6.3 Key Hyperparameters (V2)
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
@@ -431,7 +650,9 @@ python scripts/fatigue_lasso_pipeline.py `
 | `--max-ranking-iter` | 10 | IRLS iteration budget |
 | `--alpha-lo / --alpha-hi` | 0.01 / 100000 | Binary search bounds for λ |
 
-### 5.4 Output Files
+V3's hyperparameters are in §5.6.
+
+### 6.4 Output Files (V2)
 
 | File | Content |
 |------|---------|
@@ -444,9 +665,11 @@ python scripts/fatigue_lasso_pipeline.py `
 | `run_log_<ts>.txt` | Full metadata: file hashes, H shape, α, errors, IRLS history |
 | `report_<ts>.md` | Human-readable summary with ranking table |
 
-### 5.5 Stress Tensor Comparison Tool
+V3's output files are in §5.7 (mostly the same, minus the full-H dumps).
 
-The comparison tool validates the channel reduction result: does applying the sparse K-channel block cycle loads (f_max / f_min) in a full FE run reproduce the original dense-channel target stress field? The LASSO pipeline solves this in matrix space, but the FE solver is the ground truth — this tool bridges the two.
+### 6.5 Stress Tensor Comparison Tool
+
+The comparison tool (`scripts/compare_stress_tensors.py`) validates the channel reduction result: does applying the sparse K-channel block cycle loads (f_max / f_min) in a full FE run reproduce the original dense-channel target stress field? The LASSO pipeline solves this in matrix space, but the FE solver is the ground truth — this tool bridges the two. It works identically regardless of whether f_max/f_min came from V2 or V3.
 
 #### Why two separate runs are needed
 
@@ -607,7 +830,7 @@ The ECDF shows the full distribution, not just a summary statistic. Log x-scale 
 - What fraction of elements are within 10% error? (shown in legend)
 - Where is the 95th percentile error? (read from the curve at ECDF = 0.95)
 
-A good channel reduction shows a steep ECDF that reaches ~90% of elements by 10% error. A poor result has a long flat tail extending to 100–1000%. The pipeline's objective is ranking, not uniform accuracy — so a long tail is expected, but the tail elements must not include the critical rank-1/rank-2 elements.
+A good channel reduction shows a steep ECDF that reaches ~90% of elements by 10% error. A poor result has a long flat tail extending to 100–1000%. The pipeline's objective is ranking, not uniform accuracy — so a long tail is expected, but the tail elements must not include the critical rank-1/rank-2 elements. **For V3 runs, this expectation is stronger**: because V3 doesn't optimize global fit at all, a long non-critical tail is the *expected normal case*, not a warning sign — only the critical elements' own error and rank matter.
 
 #### Component bar chart (Fig 3)
 
@@ -626,45 +849,66 @@ rho_s = spearmanr(delta_sigma_VM_result, delta_sigma_VM_target).statistic
 
 ---
 
-## 6. Theoretical Properties
+## 7. Theoretical Properties
 
-### 6.1 Convexity
+### 7.1 Convexity
 
-The Phase 1 Group LASSO objective is jointly convex in f for any fixed W. BCD on a jointly-convex objective converges to the global minimum. The Phase 3 fixed-support OLS is also convex. The IRLS outer loop (Phase 3) is a heuristic and is not guaranteed to find a global ranking optimum, but the fixed-support constraint prevents the divergence that characterised V1.
+The Phase 1 Group LASSO objective is jointly convex in f for any fixed W, for **both** V2's global-row
+formulation and V3's critical-row-restricted formulation (restricting rows of a convex least-squares
+problem preserves convexity). BCD on a jointly-convex objective converges to the global minimum of that
+composite objective. The Phase 3 fixed-support OLS (V2 residual mode) is also convex.
 
-### 6.2 Physical Interpretability
+The Phase 3 *outer* loop is a heuristic in both versions, but for different reasons:
+- **V2 residual mode**: the IRLS weight-update rule is not itself derived from a single convex
+  objective being minimized across iterations — each iteration re-solves a convex sub-problem, but
+  the sequence of weight updates is a heuristic search, not gradient descent on a fixed objective.
+- **V2 ranking mode / V3**: each SLSQP call solves a convex QP (convex quadratic objective, and the
+  ranking constraints `VM_crit − VM_blocker ≥ margin` are generally **non-convex** in f, since
+  `VM(·)` is not linear — SLSQP finds a local solution to a non-convex-constrained problem at each
+  outer iteration, and the outer loop of re-linearizing the constraint set is a heuristic, not a
+  method with a global-optimum guarantee).
+
+Net effect (both versions): **no amplitude update on a fixed support is guaranteed to find a global
+ranking optimum** — the fixed-support constraint prevents the *divergence* that characterised V1
+(§4.1), but does not turn ranking search into a convex problem.
+
+### 7.2 Physical Interpretability
 
 - **Sparse group structure**: each non-zero group represents one physical attachment point with FX/FY/FZ amplitudes — directly specifiable as a test rig channel
 - **Mandatory groups**: grounded in the physical principle that if group g has near-zero influence on the critical element, no finite amplitude can produce stress at it; the influence score makes the selection transparent
 - **Shared active set for MAX/MIN**: enforces that the same physical channels are used for both the MAX and MIN load blocks in the test
 
-### 6.3 Limitations
+### 7.3 Limitations
 
-1. **Basis completeness**: if the target stress state lies outside the column span of H (e.g., because it is dominated by body-load inertia effects not representable by point forces), the channel reduction has irreducible error. Phase 0 feasibility analysis quantifies this lower bound.
+1. **Basis completeness**: if the target stress state lies outside the column span of H (e.g., because it is dominated by body-load inertia effects not representable by point forces), the channel reduction has irreducible error. Phase 0 feasibility analysis quantifies this lower bound. V3 mitigates but does not eliminate this — if the critical element itself is outside the span, no row restriction helps.
 
-2. **IRLS non-convergence**: Phase 3 is a heuristic. For some configurations, no amplitude update on the fixed support achieves the target ranking. The algorithm reports `satisfied_count / total_critical` honestly.
+2. **IRLS/SLSQP non-convergence**: Phase 3 is a heuristic in both versions (§7.1). For some configurations, no amplitude update on the fixed support achieves the target ranking. The algorithm reports `satisfied_count / total_critical` honestly.
 
 3. **Damage proxy vs. full rainflow**: the Von Mises range proxy ranks elements correctly for proportional, single-cycle loading but may diverge from Palmgren-Miner damage under complex multiaxial histories with variable amplitude.
 
 4. **Linearity assumption**: H is computed from linear elastic FE analysis. Geometric nonlinearity, contact, and material plasticity are not captured; the method applies to the linear elastic fatigue regime.
 
+5. **V3-specific — no global-fit safety net**: because V3's Phase 1 does not see the other ~18,252 elements at all, it provides no guarantee (or even visibility) into how badly non-critical elements might be mis-predicted. If the block-cycle test or downstream analysis cares about *any* element beyond the specified critical set, V3's `global_error_range` should be checked even though it isn't optimized, and V2 should be preferred if that error is unacceptably high.
+
 ---
 
-## 7. Validation Checklist
+## 8. Validation Checklist
 
-Before accepting a run result for block cycle test specification:
+Before accepting a run result for block cycle test specification (applies to both V2 and V3, with
+V3-specific notes marked):
 
 - [ ] `stress_group_influence_*.csv` shows non-trivial scores (> 0) for the critical element at the selected mandatory groups
 - [ ] Run log shows `mandatory_groups_selected` is non-empty when `--auto-mandatory-top-k > 0`
-- [ ] IRLS error history is monotonically stable (no iteration exceeds 2× the initial error)
+- [ ] (V2) IRLS error history is monotonically stable (no iteration exceeds 2× the initial error)
+- [ ] (V3) `local_fit_error_range` is the metric to track for stability across iterations; `global_error_range` is expected to be large and should not be used as a stop condition
 - [ ] `stress_ranking_check_*.csv` shows target element ranks within 10 of desired (even if not exact)
-- [ ] `relative_error_range` (Δσ fit) is below ~30%; values above ~50% indicate the SPC basis cannot span the target event stress state
-- [ ] f_max and f_min applied in a full FE run reproduce the damage ranking reported by the pipeline (cross-validation)
-- [ ] Spearman rank correlation ρ_s > 0.95 across all elements (when dual-subcase comparison is available)
+- [ ] (V2) `relative_error_range` (Δσ fit) is below ~30%; values above ~50% indicate the SPC basis cannot span the target event stress state
+- [ ] f_max and f_min applied in a full FE run reproduce the damage ranking reported by the pipeline (cross-validation) — mandatory for both versions
+- [ ] Spearman rank correlation ρ_s > 0.95 across all elements (when dual-subcase comparison is available) — for V3 runs, expect this to be **lower** than for V2 by design; only the critical elements' own rank agreement is the acceptance criterion
 
 ---
 
-## 8. Future Work
+## 9. Future Work
 
 1. **Multi-event channel reduction**: extend to multiple road-load events (one (σ_max, σ_min) pair each), solving a joint Group LASSO to find one sparse channel set that represents all events simultaneously — directly producing a multi-block duty cycle.
 
@@ -676,9 +920,97 @@ Before accepting a run result for block cycle test specification:
 
 5. **Comparison with mission synthesis**: benchmark against standard mission synthesis approaches (e.g., equivalent fatigue damage frequency-domain methods) in terms of channel count, damage ranking fidelity, and computational cost.
 
+6. **V2/V3 hybridization**: a blended objective (e.g., a weighted sum of global and critical-row residuals in Phase 1, rather than an all-or-nothing choice between V2 and V3) could recover some global fidelity without reintroducing V2's basis-insufficiency failure mode — currently unimplemented.
+
 ---
 
-## 9. References
+## 10. Appendix A — Legacy Coupon Workflow (V1, Historical Reference Only)
+
+> **Status**: `scripts/ir_lasso_pipeline.py` was removed from the repository in commit `1739a03`.
+> This appendix is retained so the original single-subcase workflow and STRS parsing conventions
+> remain documented, but **the commands below will not run** against the current codebase. There is
+> currently no direct drop-in replacement: V2 and V3 both require a MAX **and** MIN subcase pair
+> (they fit Δσ, not absolute σ), whereas the Coupon case historically had a single target subcase. If
+> a Coupon-style single-subcase smoke test is needed again, it would need to be re-implemented (e.g. a
+> thin wrapper that reuses `parse_subcases()` / `build_matrix()` from `fatigue_lasso_pipeline.py` with
+> a plain, non-range LASSO objective).
+
+### A.1 Required files
+
+- `InfluenceMatrix/le5quad4_IR/LE5Quad4_IR.strs`
+- `InfluenceMatrix/le5quad4_IR/LE5Quad4_IR.strn`
+- `InfluenceMatrix/le5quad4_SPC/LE5Quad4_SPC.strs`
+- `InfluenceMatrix/le5quad4_SPC/LE5Quad4_SPC.strn`
+
+### A.2 Assumptions
+
+- The IR files contain a single target subcase (default: the first `$SUBCASE` in file).
+- The SPC files contain multiple `$SUBCASE` sections, each corresponding to a unit load case.
+- Each `$SUBCASE` contains 24 CQUAD4 plates with 6 stress/strain components per element: XX1, XX2, YY1, YY2, XY1, XY2.
+- The vector layout is element-major with component order: XX1, YY1, XY1, XX2, YY2, XY2 (same convention V2/V3 still use today).
+
+### A.3 Parsing rules (STRS/STRN)
+
+The parser reads each file as plain text and uses these anchors:
+- Subcase start: a line matching `$SUBCASE <id>`
+- Block start: `$ELEMENT STRESS(PLATE) [REAL]` or `$ELEMENT STRAIN(PLATE) [REAL]`
+- Data rows: lines beginning with a plate ID followed by 7 numeric columns (VON, XX1, XX2, YY1, YY2, XY1, XY2)
+
+For each `$SUBCASE`, the parser extracts Plate ID and XX1, XX2, YY1, YY2, XY1, XY2. The VON column is
+ignored. (This is the same convention `parse_subcases()` in `fatigue_lasso_pipeline.py` still uses.)
+
+### A.4 Vector assembly
+
+**Target Vector E_target**
+- Source: IR `.strs` or IR `.strn`
+- Subcase: the first `$SUBCASE` (default)
+- Size: 24 × 6 = 144 entries
+- Layout: element-major, using the component order above
+- Element order: canonical from the IR target subcase, used to align all SPC subcases
+
+**Influence Matrix H**
+- Source: SPC `.strs` or SPC `.strn`
+- Columns: each `$SUBCASE` becomes one column
+- Element order: enforced to match the target subcase element IDs
+- Size: 144 × N_subcase
+- Scaling: divide each column by 1000 (unit load 1000 N)
+- Subcase IDs are kept as column labels
+
+### A.5 Optimization model (plain LASSO, no group structure, no range matching)
+
+$$
+\min_{F} \frac{1}{2n}\|H F - E_{target}\|_2^2 + \alpha \|F\|_1
+$$
+
+- `LassoCV` was used to select α automatically
+- `fit_intercept=False` to preserve physical meaning
+- No automatic normalization was performed unless enabled in the script
+
+This is the key structural difference from V2/V3: no group sparsity (elementwise L1, not Group LASSO)
+and no stress-range formulation (single absolute-stress target, not Δσ) — both were added specifically
+because of the failure modes documented in §1.3 and §4.1.
+
+### A.6 Outputs and traceability
+
+The script wrote all outputs to `outputs/`:
+- `stress_H_<timestamp>.csv`, `strain_H_<timestamp>.csv`
+- `stress_E_target_<timestamp>.csv`, `strain_E_target_<timestamp>.csv`
+- `stress_result_<timestamp>.csv`, `strain_result_<timestamp>.csv`
+- `run_log_<timestamp>.txt` (file hashes, dimensions, alpha grid, selected alpha, fit metrics)
+- `report_<timestamp>.md` (summary table, nonzero forces, error metrics)
+
+### A.7 Historical validation checklist
+
+- Each `$SUBCASE` should contain exactly 24 plates.
+- H shape is (144, N_subcase) for both stress and strain.
+- E_target shape is (144,) for both stress and strain.
+- Residual norm and relative error are reported in `report.md`.
+- Reported result: relative error < 5% (baseline sanity check — see `docs/manual_summary.md` §3.1 for
+  the current paper draft's citation of this figure).
+
+---
+
+## 11. References
 
 ### Statistical Learning
 
@@ -695,7 +1027,7 @@ Before accepting a run result for block cycle test specification:
 ### Block Cycle Testing and Road Load Data Reduction
 
 - Conle, F. A., & Mousseau, C. W. (1991). Using vehicle dynamics simulations and finite-element results to generate fatigue life contours for chassis components. *International Journal of Fatigue*, 13(3), 195–205.
-- Dreβler, K., Gründer, B., Hack, M., & Köttgen, V. B. (1996). Extrapolation of rainflow matrices. *SAE Technical Paper 960569*. SAE International.
+- Dreßler, K., Gründer, B., Hack, M., & Köttgen, V. B. (1996). Extrapolation of rainflow matrices. *SAE Technical Paper 960569*. SAE International.
 - Thomas, J.-J., Perroud, G., Bignonnet, A., & Monnet, D. (1999). Fatigue design and reliability in the automotive industry. *European Structural Integrity Society*, 23, 1–12.
 
 ### SAE Papers — Durability Test Development and Load Reduction (recent)
@@ -712,4 +1044,6 @@ Before accepting a run result for block cycle test specification:
 
 ---
 
-*Script: `scripts/fatigue_lasso_pipeline.py` | Data: `InfluenceMatrix/Cradle_HAZ_Element/`*
+*Scripts: `scripts/fatigue_lasso_pipeline.py` (V2), `scripts/fatigue_ranking_pipeline.py` (V3),
+`scripts/compare_stress_tensors.py` (validation) | Data: `InfluenceMatrix/Cradle_HAZ_Element/`
+(gitignored, not present in repo checkout)*

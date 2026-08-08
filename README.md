@@ -2,30 +2,74 @@
 
 This repository builds a stress/strain influence matrix from OptiStruct .strs/.strn outputs, solves for a **sparse set of load groups** using Group LASSO or BCD, and reproduces a target stress tensor (from a dense multi-load source such as an IR event) with a user-specified sparsity budget.
 
+Two active pipelines cover the dual-subcase (MAX + MIN) fatigue use case, sharing one STRS
+parser/matrix-builder (`fatigue_lasso_pipeline.py`):
+
+- **V2 — `scripts/fatigue_lasso_pipeline.py`**: production default. Group LASSO fits the stress
+  *range* Δσ globally across all elements, then an optional Phase 3 refines damage ranking for
+  user-specified critical elements without reopening group selection.
+- **V3 — `scripts/fatigue_ranking_pipeline.py`**: critical-ranked local-fit variant. Group LASSO fits
+  Δσ using *only* the critical elements' rows, so group selection is forced to prioritize covering
+  those elements instead of the whole component. Use this when V2 reports basis insufficiency (its
+  group selection can't excite the critical elements even though its global fit looks fine).
+
+Full math, algorithm pseudocode, CLI reference, and V2-vs-V3 guidance:
+[docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md).
+
 ## Project Layout
 
 - InfluenceMatrix/Coupon/LE5Quad4_Inertia_Relief_Target_Stress.strs
 - InfluenceMatrix/Coupon/LE5Quad4_SPC_Unit_Load_Stress.strs
 - InfluenceMatrix/Coupon/LE5Quad4_SPC_Verified_Stress.strs
-- scripts/ir_lasso_pipeline.py
+- InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt
+- InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt
+- scripts/fatigue_lasso_pipeline.py (V2, production default)
+- scripts/fatigue_ranking_pipeline.py (V3, critical-ranked local-fit)
 - scripts/compare_stress_tensors.py
 - outputs/
 
-## Quick Start (Coupon Stress)
+> `scripts/ir_lasso_pipeline.py` (legacy single-subcase Coupon LASSO) was removed from the repo in
+> commit `1739a03`; there is currently no runnable single-subcase Coupon smoke-test. See
+> [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md) Appendix A for the historical workflow.
 
-Run the LASSO pipeline on the Coupon files:
+## Quick Start (Cradle HAZ — V2, production default)
 
+```powershell
+python scripts/fatigue_lasso_pipeline.py `
+  --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+  --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+  --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
+  --max-active-groups 6 --auto-mandatory-top-k 2 `
+  --critical-elems 10058616,10014072 `
+  --target-ranking 10058616,10014072 `
+  --output-dir outputs/cradle_run
 ```
-python scripts/ir_lasso_pipeline.py --mode stress \
-  --ir-strs InfluenceMatrix/Coupon/LE5Quad4_Inertia_Relief_Target_Stress.strs \
-  --spc-strs InfluenceMatrix/Coupon/LE5Quad4_SPC_Unit_Load_Stress.strs
+
+Key outputs (in `--output-dir`): `stress_f_max_<ts>.csv` / `stress_f_min_<ts>.csv` (block-cycle load
+vectors), `stress_ranking_check_<ts>.csv` (predicted vs. target damage rank), `report_<ts>.md`,
+`run_log_<ts>.txt`.
+
+## Quick Start (Cradle HAZ — V3, critical-ranked local-fit)
+
+Use this when V2's `ranking_diagnostics.basis_insufficient_warning` fires — i.e. its globally-fitted
+group selection can't cover the critical elements no matter how much Phase 3 boosts their weight:
+
+```powershell
+python scripts/fatigue_ranking_pipeline.py `
+  --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+  --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+  --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
+  --max-active-groups 4 --auto-mandatory-top-k 2 `
+  --critical-elems 10058616,10014072 `
+  --target-ranking 10058616,10014072 `
+  --max-ranking-iter 20 `
+  --output-dir outputs/ranking_run
 ```
 
-Key outputs:
-- outputs/stress_result_<timestamp>.csv: solved force per SUBCASE
-- outputs/stress_E_target_<timestamp>.csv: flattened target vector
-- outputs/stress_H_<timestamp>.csv: influence matrix (unit-load columns)
-- outputs/report_<timestamp>.md: fit metrics
+Same output files as V2, minus the full-H/target dumps. The `report_<ts>.md` separates
+`local_fit_error_range` (optimized, at critical elements only) from `global_error_range`
+(informational only — V3 does not optimize whole-component fit). See
+[docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md) §5.8 for when to pick V2 vs. V3.
 
 ## Compare Target vs Verified Stress
 
@@ -44,14 +88,20 @@ Outputs:
 
 ## How The Pipeline Works
 
-> **Simple / Coupon path** (single subcase, 24 elements): steps 1–5 below use `ir_lasso_pipeline.py`.  
-> **Production / Fatigue path** (18 254 elements, MAX+MIN subcases, ranking enforcement): see `fatigue_lasso_pipeline.py` and [`docs/fatigue_lasso_method.md`](docs/fatigue_lasso_method.md).
+> **V2 — global-fit path** (18 254 elements, MAX+MIN subcases, ranking enforcement as a Phase-3
+> refinement): `fatigue_lasso_pipeline.py`.
+> **V3 — critical-ranked local-fit path** (same data, but Phase 1 itself is restricted to critical
+> elements' rows): `fatigue_ranking_pipeline.py`.
+> **Legacy V1 / Coupon path** (single subcase, 24 elements, plain elementwise LASSO): historical only,
+> script removed — see [`docs/fatigue_lasso_method.md`](docs/fatigue_lasso_method.md) Appendix A.
+>
+> Full math and algorithm pseudocode for all three: [`docs/fatigue_lasso_method.md`](docs/fatigue_lasso_method.md).
 
 1) Parse .strs/.strn files by SUBCASE and element ID (aligned by element ID order).
 2) Flatten per-element components into a vector using a fixed order.
-3) Build $H$ (candidate load library) and $\sigma_{target}$ (target stress from dense loads).
-4) Solve $\min_F \frac{1}{2n}\|HF - \sigma_{target}\|_2^2 + \alpha\|F\|_1$ using LassoCV.
-5) Reconstruct loads using SUBCASE IDs and validate with a verification run.
+3) Build $H$ (candidate load library) and $\Delta\sigma_{target} = \sigma_{max} - \sigma_{min}$ (stress-range target — fatigue damage is driven by cyclic range, not absolute stress).
+4) V2: Group LASSO / BCD on $\Delta\sigma_{target}$ using all rows, with a sparsity budget on active force groups. V3: the same Group LASSO / BCD machinery, but restricted to the critical elements' rows only.
+5) Reconstruct $f_{max}$/$f_{min}$ from the recovered $f_{range}$/$f_{mean}$ and validate with a full FE verification run (`compare_stress_tensors.py`).
 
 ## Common Causes Of Mismatch (Target vs Verified)
 
@@ -78,5 +128,5 @@ This means `fatigue_lasso_method.md` serves as both a technical reference and a 
 - All parsing uses only .strs/.strn files.
 - SUBCASE IDs are the only load identifiers.
 - By default, all outputs include a timestamp suffix; use --no-timestamp to keep legacy names.
-- For the Coupon case workflow, see [docs/ir_lasso_workflow.md](docs/ir_lasso_workflow.md).
-- For the production fatigue pipeline, see [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md).
+- For the full method reference — V2 (production), V3 (critical-ranked local-fit), and the legacy
+  Coupon workflow (historical, Appendix A) — see [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md).
