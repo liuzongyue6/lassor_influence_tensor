@@ -16,6 +16,43 @@ parser/matrix-builder (`fatigue_lasso_pipeline.py`):
 Full math, algorithm pseudocode, CLI reference, and V2-vs-V3 guidance:
 [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md).
 
+## Environment Setup
+
+Requires **Python 3.12** (developed against miniforge3/conda-forge).
+
+```powershell
+# 1) Create and activate an environment (conda/miniforge recommended)
+conda create -n lassor python=3.12 -y
+conda activate lassor
+
+# 2) Install dependencies
+pip install numpy scipy scikit-learn group-lasso tqdm matplotlib
+```
+
+| Package | Used by | Purpose |
+|---|---|---|
+| `numpy` | all scripts | matrix/vector math |
+| `scipy` | `fatigue_lasso_pipeline.py`, `fatigue_ranking_pipeline.py`, `compare_stress_tensors.py` | SLSQP constrained optimization (`scipy.optimize.minimize`), KDE/correlation stats |
+| `scikit-learn` | `fatigue_lasso_pipeline.py` | `LinearRegression`/`Ridge` for OLS refinement steps |
+| `group-lasso` | `fatigue_lasso_pipeline.py` | `GroupLasso` solver for Phase 1 group selection |
+| `tqdm` | `fatigue_lasso_pipeline.py` | progress bars during BCD/alpha search |
+| `matplotlib` | `compare_stress_tensors.py` only | scatter/error plots |
+
+No `requirements.txt`/`environment.yml` is checked in yet; the `pip install` line above is the
+authoritative dependency list (kept in sync with `CLAUDE.md`'s Dependencies section).
+
+Verify the install with a syntax-only smoke test (no data files needed):
+
+```powershell
+python -c "import ast; ast.parse(open('scripts/fatigue_lasso_pipeline.py').read()); print('OK')"
+```
+
+To confirm the third-party imports actually resolve:
+
+```powershell
+python -c "import numpy, scipy, sklearn, group_lasso, tqdm, matplotlib; print('deps OK')"
+```
+
 ## Project Layout
 
 - InfluenceMatrix/Coupon/LE5Quad4_Inertia_Relief_Target_Stress.strs
@@ -36,8 +73,8 @@ Full math, algorithm pseudocode, CLI reference, and V2-vs-V3 guidance:
 
 ```powershell
 python scripts/fatigue_lasso_pipeline.py `
-  --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
-  --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+  --ir-strs  inputs/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+  --spc-strs inputs/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
   --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
   --max-active-groups 6 --auto-mandatory-top-k 2 `
   --critical-elems 10058616,10014072 `
