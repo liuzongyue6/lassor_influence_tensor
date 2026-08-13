@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -58,13 +60,43 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+_LOG_BUFFER: List[str] = []
+
+
 def _log(msg: str) -> None:
-    """Print msg with HH:MM:SS timestamp prefix; handles embedded newlines."""
+    """Print msg with HH:MM:SS timestamp prefix; handles embedded newlines.
+
+    Every printed line is also appended to _LOG_BUFFER so the full console
+    trace (Phase 0/1/3 iteration diagnostics, warnings, etc.) can be persisted
+    into run_log*.txt — the console output otherwise disappears once the run
+    ends, which is the detail most needed for later report-writing/debugging.
+    """
     for line in msg.split("\n"):
-        if line:
-            print(f"[{_ts()}] {line}", flush=True)
-        else:
-            print(flush=True)
+        stamped = f"[{_ts()}] {line}" if line else ""
+        print(stamped, flush=True)
+        _LOG_BUFFER.append(stamped)
+
+
+def reset_log_buffer() -> None:
+    _LOG_BUFFER.clear()
+
+
+def get_log_buffer() -> List[str]:
+    return list(_LOG_BUFFER)
+
+
+def get_git_commit(cwd: Optional[str] = None) -> Optional[str]:
+    """Best-effort short git commit hash of the repo state at run time, for
+    tracing which version of the pipeline produced a given run_log."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=5, check=True,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1568,6 +1600,9 @@ def main() -> None:
     alpha_grid        = _parse_float_list(args.alpha_grid)
     mandatory_groups  = _parse_int_list(args.mandatory_groups)
 
+    reset_log_buffer()
+    run_started = time.time()
+
     result = run_fatigue_pipeline(
         ir_path=args.ir_strs,
         spc_path=args.spc_strs,
@@ -1598,11 +1633,17 @@ def main() -> None:
 
     log_payload = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(time.time() - run_started, 3),
+        "command": " ".join(sys.argv),
+        "cli_args": vars(args),
+        "git_commit": get_git_commit(cwd=os.path.dirname(os.path.abspath(__file__))),
+        "script": os.path.basename(__file__),
         "files": {
             "ir_strs":  sha256_file(args.ir_strs),
             "spc_strs": sha256_file(args.spc_strs),
         },
         "metadata": meta,
+        "console_log": get_log_buffer(),
     }
     write_log(    os.path.join(args.output_dir, f"run_log{output_suffix}.txt"),    log_payload)
     write_report( os.path.join(args.output_dir, f"report{output_suffix}.md"),      meta)

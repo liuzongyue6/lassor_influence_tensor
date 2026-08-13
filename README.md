@@ -58,8 +58,8 @@ python -c "import numpy, scipy, sklearn, group_lasso, tqdm, matplotlib; print('d
 - InfluenceMatrix/Coupon/LE5Quad4_Inertia_Relief_Target_Stress.strs
 - InfluenceMatrix/Coupon/LE5Quad4_SPC_Unit_Load_Stress.strs
 - InfluenceMatrix/Coupon/LE5Quad4_SPC_Verified_Stress.strs
-- InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt
-- InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt
+- inputs/Cradle_HAZ_Element/Xpeng_Target_Stress.txt
+- inputs/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt
 - scripts/fatigue_lasso_pipeline.py (V2, production default)
 - scripts/fatigue_ranking_pipeline.py (V3, critical-ranked local-fit)
 - scripts/compare_stress_tensors.py
@@ -93,8 +93,8 @@ group selection can't cover the critical elements no matter how much Phase 3 boo
 
 ```powershell
 python scripts/fatigue_ranking_pipeline.py `
-  --ir-strs  InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
-  --spc-strs InfluenceMatrix/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
+  --ir-strs  inputs/Cradle_HAZ_Element/Xpeng_Target_Stress.txt `
+  --spc-strs inputs/Cradle_HAZ_Element/Xpeng_Unit_Load_Stress.txt `
   --ir-max-subcase 1000001 --ir-min-subcase 1000002 `
   --max-active-groups 4 --auto-mandatory-top-k 2 `
   --critical-elems 10058616,10014072 `
@@ -107,6 +107,70 @@ Same output files as V2, minus the full-H/target dumps. The `report_<ts>.md` sep
 `local_fit_error_range` (optimized, at critical elements only) from `global_error_range`
 (informational only — V3 does not optimize whole-component fit). See
 [docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md) §5.8 for when to pick V2 vs. V3.
+
+## CLI Parameter Reference
+
+Both pipelines share the same input files and STRS parser; flags marked **required** have no default.
+
+### V2 — `scripts/fatigue_lasso_pipeline.py`
+
+```powershell
+python scripts/fatigue_lasso_pipeline.py --ir-strs <path> --spc-strs <path> [options]
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--ir-strs` | str | **required** | Target stress file containing MAX and MIN subcases |
+| `--spc-strs` | str | **required** | Unit load stress file (one subcase per force direction) |
+| `--ir-max-subcase` | int | `1000001` | Subcase ID for σ_max (peak) |
+| `--ir-min-subcase` | int | `1000002` | Subcase ID for σ_min (valley) |
+| `--scale-h` | float | `1000.0` | Scale factor applied to influence matrix columns (unit load magnitude) |
+| `--max-active-groups` | int | `None` | Max number of active force groups (FX/FY/FZ triplets); triggers binary search for α. Omit for no limit (falls back to `--alpha-grid` search) |
+| `--critical-elems` | str (CSV) | `""` | Element IDs to up-weight, e.g. `10058616,10014072` |
+| `--critical-weight` | float | `10.0` | Weight multiplier applied to critical element residuals |
+| `--target-ranking` | str (CSV) | `""` | Ordered element IDs: position 0 → global rank 1, position 1 → rank 2, … Activates Phase-3 IRLS ranking refinement |
+| `--alpha-grid` | str (CSV floats) | `0.1,1,10,100,1000` | α candidates for grid search (only used when `--max-active-groups` is not set) |
+| `--alpha-lo` | float | `0.01` | Binary-search lower bound for α |
+| `--alpha-hi` | float | `100000.0` | Binary-search upper bound for α |
+| `--auto-mandatory-top-k` | int | `2` | Phase 0: top-K force groups by influence per critical element to always activate. `0` disables Phase 0 |
+| `--mandatory-groups` | str (CSV ints) | `""` | Phase 0: additional 0-indexed group indices to always activate, e.g. `0,3,7` |
+| `--max-ranking-iter` | int | `10` | Max iterations for Phase-3 ranking refinement |
+| `--gamma` | float | `2.0` | (`residual` mode only) IRLS weight amplification factor per rank-gap unit |
+| `--irls-mode` | `residual` \| `ranking` | `residual` | `residual`: IRLS weight boosting (can saturate at 1e8, collapsing global fit). `ranking`: SLSQP constrained OLS — global-fit objective with hard `VM_crit ≥ VM_competitor` constraints, no weight saturation |
+| `--ranking-margin` | float | `0.0` | (`ranking` mode only) required margin, Pa: `VM_crit − VM_competitor ≥ margin` |
+| `--feasibility-check` / `--no-feasibility-check` | flag | `True` | Run unconstrained OLS before Phase 1 to log the achievable rank upper bound |
+| `--standardize` / `--no-standardize` | flag | `True` | Standardize columns before Group LASSO |
+| `--output-dir` | str | `outputs` | Output directory |
+| `--timestamp` / `--no-timestamp` | flag | `True` | Suffix output filenames with a timestamp |
+
+### V3 — `scripts/fatigue_ranking_pipeline.py`
+
+```powershell
+python scripts/fatigue_ranking_pipeline.py --ir-strs <path> --spc-strs <path> [options]
+```
+
+Same shared flags as V2 (`--ir-strs`, `--spc-strs`, `--ir-max-subcase`, `--ir-min-subcase`, `--scale-h`,
+`--max-active-groups`, `--critical-elems`, `--critical-weight`, `--target-ranking`,
+`--auto-mandatory-top-k`, `--mandatory-groups`, `--alpha-lo`, `--alpha-hi`, `--max-ranking-iter`,
+`--ranking-margin`, `--feasibility-check`/`--no-feasibility-check`, `--standardize`/`--no-standardize`,
+`--output-dir`, `--timestamp`/`--no-timestamp`) with these differences:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--max-active-groups` | int | `6` | (V3 default differs from V2's unlimited default) |
+| `--max-ranking-iter` | int | `20` | (V3 default differs from V2's `10`; counts SLSQP iterations, not IRLS iterations) |
+| `--max-blockers-per-iter` | int | `200` | Max blocker constraints per SLSQP call (worst violators first) |
+
+V3 has **no** `--alpha-grid`, `--gamma`, or `--irls-mode` — Phase 1 always fits critical-element rows
+only, and Phase 3 is always the local-fit SLSQP ranking solve (see
+[docs/fatigue_lasso_method.md](docs/fatigue_lasso_method.md) §5 for why).
+
+### Run log
+
+Every run writes `run_log<_ts>.txt` (JSON) to `--output-dir`, capturing the exact command line, all
+resolved CLI args, the git commit the run was executed at, elapsed wall-clock time, SHA-256 hashes of
+the two input files, the full metadata dict, and the complete console trace (`[INFO]`/`[WARNING]`/
+iteration lines) — enough to reproduce or debug a run without re-executing it.
 
 ## Compare Target vs Verified Stress
 

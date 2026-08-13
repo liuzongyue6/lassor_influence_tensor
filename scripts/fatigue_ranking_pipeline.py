@@ -45,6 +45,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -64,7 +65,7 @@ try:
         find_alpha_for_k_groups, solve_bcd,
         compute_group_influence, solve_phase2_mean,
         write_influence_csv, write_force_csv, write_ranking_csv,
-        write_log, _log,
+        write_log, _log, reset_log_buffer, get_log_buffer, get_git_commit,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,7 +80,7 @@ except ImportError:
         find_alpha_for_k_groups, solve_bcd,
         compute_group_influence, solve_phase2_mean,
         write_influence_csv, write_force_csv, write_ranking_csv,
-        write_log, _log,
+        write_log, _log, reset_log_buffer, get_log_buffer, get_git_commit,
     )
 
 DEFAULT_OUTPUT_DIR = "outputs"
@@ -779,6 +780,9 @@ def main() -> None:
     timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S") if args.timestamp else ""
     output_suffix = f"_{timestamp}" if timestamp else ""
 
+    reset_log_buffer()
+    run_started = time.time()
+
     result = run_ranking_pipeline(
         ir_path=args.ir_strs,
         spc_path=args.spc_strs,
@@ -807,11 +811,17 @@ def main() -> None:
 
     log_payload = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(time.time() - run_started, 3),
+        "command": " ".join(sys.argv),
+        "cli_args": vars(args),
+        "git_commit": get_git_commit(cwd=os.path.dirname(os.path.abspath(__file__))),
+        "script": os.path.basename(__file__),
         "files": {
             "ir_strs":  sha256_file(args.ir_strs),
             "spc_strs": sha256_file(args.spc_strs),
         },
         "metadata": meta,
+        "console_log": get_log_buffer(),
     }
     write_log(
         os.path.join(args.output_dir, f"run_log{output_suffix}.txt"),
