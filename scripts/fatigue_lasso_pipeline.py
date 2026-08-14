@@ -396,6 +396,25 @@ def build_element_weights(
     return weights
 
 
+def _make_crit_row_mask(
+    elem_ids: List[int],
+    crit_ids: List[int],
+    n_comp: int,
+) -> np.ndarray:
+    """Boolean mask over all m rows; True for rows belonging to critical elements.
+
+    Used as the ``fit_row_mask`` that restricts a least-squares objective to the
+    critical elements only — the well-conditioned limit of letting
+    ``--critical-weight`` grow without bound in :func:`build_element_weights`.
+    """
+    mask = np.zeros(len(elem_ids) * n_comp, dtype=bool)
+    crit_set = set(crit_ids)
+    for idx, eid in enumerate(elem_ids):
+        if eid in crit_set:
+            mask[idx * n_comp : (idx + 1) * n_comp] = True
+    return mask
+
+
 def compute_von_mises_range(
     delta_sigma: np.ndarray,
     n_elem: int,
@@ -768,18 +787,24 @@ def solve_ranking_constrained(
     f_init: np.ndarray,
     margin: float = 0.0,
     max_iter: int = 20,
+    fit_row_mask: Optional[np.ndarray] = None,
+    local_row_mask: Optional[np.ndarray] = None,
+    max_blockers_per_iter: Optional[int] = None,
+    slsqp_maxiter: int = 200,
+    slsqp_ftol: float = 1e-10,
+    prune_satisfied_criticals: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     """Direct ranking optimisation on fixed active support (--irls-mode ranking).
 
     Goal: find f such that VM_range(critical element) > VM_range(all others).
-    This is NOT a stress-matching problem — the objective is global Δσ fit,
-    and the constraints directly enforce the damage-ranking goal.
+    This is NOT a stress-matching problem — the least-squares objective only
+    anchors the amplitudes, and the constraints directly enforce the ranking.
 
     Algorithm (outer loop, max_iter iterations):
-      Precompute: HtH = H_active^T H_active  (n×n)
-                  Htb = H_active^T delta_sigma (n,)
+      Precompute: HtH = H_fit^T H_fit  (n×n)
+                  Htb = H_fit^T delta_sigma_fit (n,)
       Each iteration:
-        1. Compute ranking from current f
+        1. Compute ranking from current f  (always over ALL elements)
         2. For each critical element c with desired rank p and current rank r:
              blockers = elements currently ranked 1..p (must be displaced below c)
              Add SLSQP constraint: VM_c(f) - VM_blocker(f) >= margin
@@ -788,7 +813,22 @@ def solve_ranking_constrained(
         5. Break on convergence or 3 no-improvements
 
     Key advantage vs residual mode: no element weight saturation — constraints
-    express the ranking goal directly, and the objective is always global fit.
+    express the ranking goal directly, and the objective never blows up.
+
+    Fit scope
+    ---------
+    ``fit_row_mask`` selects which rows of H form the least-squares objective:
+
+    * ``None``  — all m rows (global fit).  This is the V2 behaviour and the default.
+    * a boolean mask — only those rows (e.g. the critical elements' rows), which is
+      the V3 "local fit" objective.  Ranking evaluation still uses all elements.
+
+    ``local_row_mask`` is diagnostics-only: when given, ``local_err`` is reported
+    alongside the global ``rel_err`` in ``history`` and in the returned diagnostics.
+
+    The remaining keyword arguments default to the V2 behaviour; passing
+    ``max_blockers_per_iter``/``slsqp_maxiter``/``slsqp_ftol``/``prune_satisfied_criticals``
+    reproduces the V3 local-fit solver exactly.
     """
     try:
         from scipy.optimize import minimize as _sp_minimize
@@ -801,10 +841,31 @@ def solve_ranking_constrained(
     elem_idx  = {eid: i for i, eid in enumerate(elem_ids)}
     K         = len(target_ranking)
 
+    # Rows forming the least-squares objective (None ⇒ all rows, i.e. global fit)
+    if fit_row_mask is None:
+        H_fit     = H_active
+        delta_fit = delta_sigma
+    else:
+        H_fit     = H[fit_row_mask][:, active_mask]
+        delta_fit = delta_sigma[fit_row_mask]
+
+    # Optional diagnostics-only row subset (never affects the objective)
+    if local_row_mask is None:
+        H_local = delta_local = None
+    else:
+        H_local     = H[local_row_mask][:, active_mask]
+        delta_local = delta_sigma[local_row_mask]
+
+    def _local_error(fa: np.ndarray) -> Optional[float]:
+        if H_local is None:
+            return None
+        return float(np.linalg.norm(H_local @ fa - delta_local)
+                     / (np.linalg.norm(delta_local) + 1e-12))
+
     # Precompute normal equations (cheap: n×n where n = 3*|active_groups| ≤ ~45)
-    HtH = H_active.T @ H_active
-    Htb = H_active.T @ delta_sigma
-    b_norm_sq = float(np.dot(delta_sigma, delta_sigma))
+    HtH = H_fit.T @ H_fit
+    Htb = H_fit.T @ delta_fit
+    b_norm_sq = float(np.dot(delta_fit, delta_fit))
 
     def _objective(fa: np.ndarray) -> float:
         return float(fa @ HtH @ fa) - 2.0 * float(Htb @ fa) + b_norm_sq
@@ -846,16 +907,32 @@ def solve_ranking_constrained(
             H_crit_sub = H_active[crit_i * n_comp : (crit_i + 1) * n_comp, :]
 
             # Blockers: elements ranked above desired_rank (must be pushed below crit)
-            blocker_indices = [
+            blocker_set = set(
                 j for j in range(n_elem)
                 if ranks[j] <= desired_rank and j != crit_i
-            ]
+            )
             # Also include any element currently ranked between desired_rank and actual_rank
-            blocker_indices += [
+            blocker_set.update(
                 j for j in range(n_elem)
                 if desired_rank < ranks[j] < actual_rank and j != crit_i
-            ]
-            blocker_indices = list(set(blocker_indices))
+            )
+
+            if prune_satisfied_criticals:
+                # Don't fight an already-satisfied higher-priority critical element
+                for prev_idx in range(p_idx):
+                    prev_id = target_ranking[prev_idx]
+                    if prev_id in elem_idx and ranks[elem_idx[prev_id]] == prev_idx + 1:
+                        blocker_set.discard(elem_idx[prev_id])
+
+            if max_blockers_per_iter is None:
+                blocker_indices = list(blocker_set)
+            else:
+                # Worst violation first (largest proxy gap over the critical element)
+                blocker_indices = sorted(
+                    blocker_set,
+                    key=lambda j: float(s_e[j] - s_e[crit_i]),
+                    reverse=True,
+                )[:max_blockers_per_iter]
 
             for bi in blocker_indices:
                 H_blocker_sub = H_active[bi * n_comp : (bi + 1) * n_comp, :]
@@ -868,11 +945,18 @@ def solve_ranking_constrained(
 
         rel_err = float(np.linalg.norm(H_active @ f_current - delta_sigma)
                         / (np.linalg.norm(delta_sigma) + 1e-12))
-        history.append({"iter": k, "n_satisfied": n_satisfied, "rel_err": rel_err, "details": details})
+        local_err = _local_error(f_current)
+        hist_entry = {"iter": k, "n_satisfied": n_satisfied, "rel_err": rel_err, "details": details}
+        if local_err is not None:
+            hist_entry["local_err"] = local_err
+        history.append(hist_entry)
 
+        err_txt = f"range_err={rel_err:.3%}"
+        if local_err is not None:
+            err_txt = f"local_fit_err={local_err:.3%} | {err_txt}"
         _log(
             f"[Iter {k:2d}][ranking] satisfied {n_satisfied}/{K} "
-            f"| range_err={rel_err:.3%} | constraints={len(constraints)}"
+            f"| {err_txt} | constraints={len(constraints)}"
         )
         for d in details:
             status = "OK" if d["actual"] == d["desired"] else "--"
@@ -892,6 +976,7 @@ def solve_ranking_constrained(
                 "s_e": s_e.copy(),
                 "ranks": ranks.copy(),
                 "rel_err": rel_err,
+                "local_err": local_err,
             }
             no_improve_count = 0
         else:
@@ -915,7 +1000,7 @@ def solve_ranking_constrained(
             jac=_grad_objective,
             method="SLSQP",
             constraints=constraints,
-            options={"maxiter": 200, "ftol": 1e-10, "disp": False},
+            options={"maxiter": slsqp_maxiter, "ftol": slsqp_ftol, "disp": False},
         )
         if not result.success and result.status not in (0, 9):
             _log(f"[WARNING] SLSQP iter {k}: {result.message} (continuing with best feasible point)")
@@ -951,6 +1036,8 @@ def solve_ranking_constrained(
         "irls_mode":            "ranking",
         "basis_insufficient_warning": (best_satisfied < K and best_state["iter"] == 0),
     }
+    if best_state.get("local_err") is not None:
+        diag["final_local_fit_error"] = best_state["local_err"]
     return final_f, diag
 
 
@@ -1055,6 +1142,59 @@ def solve_phase1_with_ranking(
         return final_f, active_mask_fixed, alpha_used, diag
 
     # ── Residual mode: IRLS — magnitude tuning on fixed support ───────────
+    return solve_residual_irls(
+        H, delta_sigma, weights_init, active_mask_fixed, elem_ids, n_comp,
+        target_ranking, alpha_used, gamma=gamma, max_iter=max_iter,
+    )
+
+
+def solve_residual_irls(
+    H: np.ndarray,
+    delta_sigma: np.ndarray,
+    weights_init: np.ndarray,
+    active_mask_fixed: np.ndarray,
+    elem_ids: List[int],
+    n_comp: int,
+    target_ranking: List[int],
+    alpha_used: float,
+    gamma: float = 2.0,
+    max_iter: int = 10,
+    fit_row_mask: Optional[np.ndarray] = None,
+    local_row_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, dict]:
+    """Phase 3 residual mode: fixed-support IRLS with γ^gap weight boosting.
+
+    Each iteration refits amplitudes by weighted OLS on the LOCKED support
+    ``active_mask_fixed`` (group selection is never re-run — that was the V1
+    error-explosion bug), then multiplies the weight of every under-ranked
+    critical element by γ^gap, capped at 1e8 in log space.
+
+    ``fit_row_mask`` selects the rows the weighted OLS fits: ``None`` (default)
+    fits all m rows, matching V2.  A boolean mask restricts the fit to those rows
+    (e.g. the critical elements' rows).  Ranking is always evaluated over all
+    elements.  ``local_row_mask`` is diagnostics-only and adds ``local_err`` to
+    the history entries.
+
+    Returns ``(f_range, active_mask, alpha, diagnostics)`` — the same 4-tuple as
+    :func:`solve_phase1_with_ranking`, taken from the best-ranking iteration.
+    """
+    weights  = weights_init.copy()
+    n_elem   = len(elem_ids)
+    elem_idx = {eid: i for i, eid in enumerate(elem_ids)}
+    K        = len(target_ranking)
+    n_active_fixed = _count_active_groups(active_mask_fixed, GROUP_SIZE)
+
+    # Rows the weighted OLS actually fits (None ⇒ all rows, i.e. V2 global fit)
+    H_fit     = H if fit_row_mask is None else H[fit_row_mask]
+    delta_fit = delta_sigma if fit_row_mask is None else delta_sigma[fit_row_mask]
+
+    def _local_error(f: np.ndarray) -> Optional[float]:
+        if local_row_mask is None:
+            return None
+        pred = H[local_row_mask] @ f
+        tgt  = delta_sigma[local_row_mask]
+        return float(np.linalg.norm(pred - tgt) / (np.linalg.norm(tgt) + 1e-12))
+
     # Per-critical-element weight multipliers (updated independently)
     per_elem_mult: Dict[int, float] = {
         eid: float(weights_init[elem_idx[eid] * n_comp])
@@ -1070,7 +1210,8 @@ def solve_phase1_with_ranking(
 
     for k in tqdm(range(max_iter), desc="IRLS ranking iterations"):
         # Weighted OLS on FIXED support — no new group selection
-        f_range    = _weighted_ols_fixed_support(H, delta_sigma, weights, active_mask_fixed)
+        w_fit      = weights if fit_row_mask is None else weights[fit_row_mask]
+        f_range    = _weighted_ols_fixed_support(H_fit, delta_fit, w_fit, active_mask_fixed)
         residual   = H @ f_range - delta_sigma
         rel_err    = float(np.linalg.norm(residual) / (np.linalg.norm(delta_sigma) + 1e-12))
         if initial_rel_err is None:
@@ -1109,10 +1250,17 @@ def solve_phase1_with_ranking(
             }
             for p, c in enumerate(target_ranking, start=1)
         ]
-        history.append({"iter": k, "n_satisfied": n_satisfied, "rel_err": rel_err, "details": details})
+        local_err  = _local_error(f_range)
+        hist_entry = {"iter": k, "n_satisfied": n_satisfied, "rel_err": rel_err, "details": details}
+        if local_err is not None:
+            hist_entry["local_err"] = local_err
+        history.append(hist_entry)
+        err_txt = f"range_err={rel_err:.3%}"
+        if local_err is not None:
+            err_txt = f"local_fit_err={local_err:.3%} | {err_txt}"
         _log(
             f"[Iter {k:2d}] satisfied {n_satisfied}/{K} "
-            f"| range_err={rel_err:.3%} "
+            f"| {err_txt} "
             f"| active_groups={n_active_fixed}"
         )
         for d in details:
@@ -1136,6 +1284,7 @@ def solve_phase1_with_ranking(
                 "s_e":        s_e.copy(),
                 "ranks":      ranks.copy(),
                 "rel_err":    rel_err,
+                "local_err":  local_err,
             }
             no_improve_count = 0
         else:
@@ -1215,6 +1364,8 @@ def solve_phase1_with_ranking(
         "irls_mode":                "residual",
         "basis_insufficient_warning": basis_insufficient,
     }
+    if best_state.get("local_err") is not None:
+        diag["final_local_fit_error"] = best_state["local_err"]
 
     return final_f, final_mask, final_alpha, diag
 
@@ -1222,6 +1373,116 @@ def solve_phase1_with_ranking(
 # ---------------------------------------------------------------------------
 # Top-level pipeline
 # ---------------------------------------------------------------------------
+
+def run_phase0(
+    H: np.ndarray,
+    delta_sigma: np.ndarray,
+    elem_ids: List[int],
+    all_critical: List[int],
+    target_ranking: List[int],
+    subcase_ids: List[int],
+    n_groups: int,
+    auto_mandatory_top_k: int,
+    mandatory_groups: List[int],
+    output_dir: str,
+    output_suffix: str,
+    feasibility_check: bool,
+) -> dict:
+    """Phase 0 — influence-guided mandatory group pre-selection + feasibility check.
+
+    Scores every (critical element, force group) pair by the Frobenius norm of the
+    corresponding 6×3 H submatrix, promotes the top-``auto_mandatory_top_k`` groups
+    per critical element (plus any user-specified ``mandatory_groups``) to mandatory,
+    and writes ``stress_group_influence<suffix>.csv``.
+
+    When ``feasibility_check`` is set, an unconstrained OLS over ALL groups is run
+    first: if a critical element cannot reach its desired rank even then, no sparse
+    selection can achieve it and a warning is logged.
+
+    Shared verbatim by every pipeline version — Phase 0 does not depend on fit scope
+    or on the Phase 3 mode.
+
+    Returns ``{"mandatory_feature_mask", "mandatory_groups_selected", "influence"}``.
+    """
+    n_elem       = len(elem_ids)
+    elem_idx_map = {eid: i for i, eid in enumerate(elem_ids)}
+
+    mandatory_feature_mask = np.zeros(H.shape[1], dtype=bool)
+    influence_dict: Dict[int, np.ndarray] = {}
+    selected_mandatory_groups: List[int] = []
+
+    if all_critical and (auto_mandatory_top_k > 0 or mandatory_groups):
+        _log("[INFO] Phase 0: Computing group influence on critical elements...")
+        influence_dict = compute_group_influence(
+            H, all_critical, elem_ids, GROUP_SIZE, len(COMPONENT_ORDER)
+        )
+        if auto_mandatory_top_k > 0:
+            for eid, scores in sorted(influence_dict.items()):
+                top_k_idx  = np.argsort(-scores)[:auto_mandatory_top_k]
+                top_scores = scores[top_k_idx]
+                _log(
+                    f"  Influence top-{auto_mandatory_top_k} for elem {eid}: "
+                    f"groups {top_k_idx.tolist()} "
+                    f"(Frobenius: {[f'{v:.3e}' for v in top_scores]})"
+                )
+        mandatory_group_set: set = set(mandatory_groups)  # user-specified indices
+        if auto_mandatory_top_k > 0:
+            for scores in influence_dict.values():
+                top_k = np.argsort(-scores)[:auto_mandatory_top_k]
+                mandatory_group_set.update(top_k.tolist())
+        # Clamp to valid range
+        mandatory_group_set = {g for g in mandatory_group_set if 0 <= g < n_groups}
+        selected_mandatory_groups = sorted(mandatory_group_set)
+        for g in selected_mandatory_groups:
+            s = g * GROUP_SIZE
+            e = min((g + 1) * GROUP_SIZE, H.shape[1])
+            mandatory_feature_mask[s:e] = True
+        n_mand = len(selected_mandatory_groups)
+        mand_sc_labels = [
+            str(subcase_ids[g * 3]) if g * 3 < len(subcase_ids) else f"g{g}"
+            for g in selected_mandatory_groups
+        ]
+        _log(
+            f"[INFO] Mandatory groups ({n_mand}): {selected_mandatory_groups} "
+            f"(lead subcases: {mand_sc_labels})"
+        )
+        ensure_dir(output_dir)
+        write_influence_csv(
+            os.path.join(output_dir, f"stress_group_influence{output_suffix}.csv"),
+            influence_dict, n_groups, subcase_ids,
+        )
+
+    # ── Phase 0 feasibility check (optional) ──────────────────────────────
+    if feasibility_check and all_critical and target_ranking:
+        _log(f"[INFO] Phase 0 feasibility: unconstrained OLS (all {n_groups} groups)...")
+        f_full_ols, _, _, _ = np.linalg.lstsq(H, delta_sigma, rcond=None)
+        err_full = float(
+            np.linalg.norm(H @ f_full_ols - delta_sigma) / (np.linalg.norm(delta_sigma) + 1e-12)
+        )
+        s_e_full   = compute_von_mises_range(H @ f_full_ols, n_elem, COMPONENT_ORDER)
+        ranks_full = _element_ranks(s_e_full)
+        _log(f"[INFO]   Unconstrained OLS error = {err_full:.3%}")
+        _log(f"         {'elem_id':>12s}  {'unconstrained_rank':>18s}  {'desired_rank':>12s}")
+        for eid in all_critical:
+            if eid not in elem_idx_map:
+                continue
+            unc_rank    = int(ranks_full[elem_idx_map[eid]])
+            desired     = target_ranking.index(eid) + 1 if eid in target_ranking else None
+            desired_str = str(desired) if desired else "—"
+            _log(f"         {eid:>12d}  {unc_rank:>18d}  {desired_str:>12s}")
+            if desired is not None and unc_rank > desired:
+                _log(
+                    f"[WARNING] Phase 0 feasibility: elem {eid} ranks {unc_rank} even with ALL "
+                    f"{n_groups} groups unconstrained (desired: {desired}). "
+                    f"The SPC basis cannot achieve this ranking under ANY sparse selection."
+                )
+
+    return {
+        "mandatory_feature_mask":  mandatory_feature_mask,
+        "mandatory_groups_selected": selected_mandatory_groups,
+        "influence":               influence_dict,
+    }
+
 
 def run_fatigue_pipeline(
     ir_path: str,
@@ -1305,75 +1566,22 @@ def run_fatigue_pipeline(
     elem_idx_map = {eid: i for i, eid in enumerate(ref_ids)}
 
     # ── Phase 0: influence-guided mandatory group selection ────────────────
-    mandatory_feature_mask = np.zeros(H.shape[1], dtype=bool)
-    influence_dict: Dict[int, np.ndarray] = {}
-    selected_mandatory_groups: List[int] = []
-
-    if all_critical and (auto_mandatory_top_k > 0 or mandatory_groups):
-        _log("[INFO] Phase 0: Computing group influence on critical elements...")
-        influence_dict = compute_group_influence(
-            H, all_critical, ref_ids, GROUP_SIZE, len(COMPONENT_ORDER)
-        )
-        if auto_mandatory_top_k > 0:
-            for eid, scores in sorted(influence_dict.items()):
-                top_k_idx  = np.argsort(-scores)[:auto_mandatory_top_k]
-                top_scores = scores[top_k_idx]
-                _log(
-                    f"  Influence top-{auto_mandatory_top_k} for elem {eid}: "
-                    f"groups {top_k_idx.tolist()} "
-                    f"(Frobenius: {[f'{v:.3e}' for v in top_scores]})"
-                )
-        mandatory_group_set: set = set(mandatory_groups)  # user-specified indices
-        if auto_mandatory_top_k > 0:
-            for scores in influence_dict.values():
-                top_k = np.argsort(-scores)[:auto_mandatory_top_k]
-                mandatory_group_set.update(top_k.tolist())
-        # Clamp to valid range
-        mandatory_group_set = {g for g in mandatory_group_set if 0 <= g < n_groups}
-        selected_mandatory_groups = sorted(mandatory_group_set)
-        for g in selected_mandatory_groups:
-            s = g * GROUP_SIZE
-            e = min((g + 1) * GROUP_SIZE, H.shape[1])
-            mandatory_feature_mask[s:e] = True
-        n_mand = len(selected_mandatory_groups)
-        mand_sc_labels = [
-            str(subcase_ids[g * 3]) if g * 3 < len(subcase_ids) else f"g{g}"
-            for g in selected_mandatory_groups
-        ]
-        _log(
-            f"[INFO] Mandatory groups ({n_mand}): {selected_mandatory_groups} "
-            f"(lead subcases: {mand_sc_labels})"
-        )
-        ensure_dir(output_dir)
-        write_influence_csv(
-            os.path.join(output_dir, f"stress_group_influence{output_suffix}.csv"),
-            influence_dict, n_groups, subcase_ids,
-        )
-
-    # ── Phase 0 feasibility check (optional) ──────────────────────────────
-    if feasibility_check and all_critical and target_ranking:
-        _log(f"[INFO] Phase 0 feasibility: unconstrained OLS (all {n_groups} groups)...")
-        f_full_ols, _, _, _ = np.linalg.lstsq(H, delta_sigma, rcond=None)
-        err_full = float(
-            np.linalg.norm(H @ f_full_ols - delta_sigma) / (np.linalg.norm(delta_sigma) + 1e-12)
-        )
-        s_e_full   = compute_von_mises_range(H @ f_full_ols, n_elem, COMPONENT_ORDER)
-        ranks_full = _element_ranks(s_e_full)
-        _log(f"[INFO]   Unconstrained OLS error = {err_full:.3%}")
-        _log(f"         {'elem_id':>12s}  {'unconstrained_rank':>18s}  {'desired_rank':>12s}")
-        for eid in all_critical:
-            if eid not in elem_idx_map:
-                continue
-            unc_rank    = int(ranks_full[elem_idx_map[eid]])
-            desired     = target_ranking.index(eid) + 1 if eid in target_ranking else None
-            desired_str = str(desired) if desired else "—"
-            _log(f"         {eid:>12d}  {unc_rank:>18d}  {desired_str:>12s}")
-            if desired is not None and unc_rank > desired:
-                _log(
-                    f"[WARNING] Phase 0 feasibility: elem {eid} ranks {unc_rank} even with ALL "
-                    f"{n_groups} groups unconstrained (desired: {desired}). "
-                    f"The SPC basis cannot achieve this ranking under ANY sparse selection."
-                )
+    phase0 = run_phase0(
+        H=H,
+        delta_sigma=delta_sigma,
+        elem_ids=ref_ids,
+        all_critical=all_critical,
+        target_ranking=target_ranking,
+        subcase_ids=subcase_ids,
+        n_groups=n_groups,
+        auto_mandatory_top_k=auto_mandatory_top_k,
+        mandatory_groups=mandatory_groups,
+        output_dir=output_dir,
+        output_suffix=output_suffix,
+        feasibility_check=feasibility_check,
+    )
+    mandatory_feature_mask    = phase0["mandatory_feature_mask"]
+    selected_mandatory_groups = phase0["mandatory_groups_selected"]
 
     # ── Phase 1 (+ Phase 3 if ranking requested) ──────────────────────────
     _log("[INFO] Phase 1/3: Group LASSO + IRLS on stress range (delta_sigma)...")
